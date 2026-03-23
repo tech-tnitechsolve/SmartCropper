@@ -1,19 +1,12 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║  SMART SUBJECT CROPPER v2.5 — AI-Powered Batch Image Cropping      ║
-║                                                                      ║
-║  Core Logic:                                                         ║
-║  • Output giữ ĐÚNG frame ratio & kích thước ảnh gốc                ║
-║  • Chủ thể sát nền nhất có thể (padding cố định ~10px)             ║
-║  • Edge-aware: nếu chủ thể sát biên ảnh → KHÔNG thêm padding      ║
-║  • Loại bỏ chỉ khi CẢ HAI cạnh < ngưỡng (max > ngưỡng → giữ)     ║
-║  • AI mask 3 lớp: rembg → morpho → connected component + refine    ║
+║  SMART SUBJECT CROPPER v3.1.1 — Thumbnail Fix                      ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
-import sys, os, gc, time, shutil, platform, subprocess
+import sys, os, gc, json, time, shutil, platform, subprocess
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 import cv2
 import numpy as np
 import psutil
@@ -25,8 +18,9 @@ from PyQt6.QtWidgets import (
     QSizePolicy, QMessageBox, QGroupBox, QSpinBox, QComboBox,
     QCheckBox, QSlider, QFrame, QScrollArea, QGridLayout,
     QFileDialog, QTabWidget, QRadioButton, QButtonGroup,
+    QLineEdit, QStatusBar,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QMutex, QWaitCondition
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QMutex, QWaitCondition, QTimer
 from PyQt6.QtGui import (
     QFont, QPixmap, QImage, QColor, QPainter, QPen,
     QPainterPath, QTextCursor,
@@ -37,9 +31,14 @@ from PyQt6.QtGui import (
 # ║  SECTION 1 — CONSTANTS                                      ║
 # ╚══════════════════════════════════════════════════════════════╝
 
-APP_TITLE = "Smart Subject Cropper v2.5"
+APP_TITLE = "Smart Subject Cropper v3.1"
 SUPPORTED_EXT = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif"}
 THUMB_PX = 128
+SETTINGS_FILE = Path(__file__).parent / "cropper_settings.json"
+
+MAX_GRID_CARDS = 500
+GC_EVERY_N = 25
+RAM_THROTTLE_PCT = 85
 
 FRAME_OPTIONS = [
     ("🔄 Tự động (giữ tỷ lệ ảnh gốc)", 0, 0),
@@ -54,38 +53,61 @@ FRAME_OPTIONS = [
 ]
 
 
+# ╔══════════════════════════════════════════════════════════════╗
+# ║  SECTION 2 — SETTINGS                                       ║
+# ╚══════════════════════════════════════════════════════════════╝
+
 @dataclass
 class CropSettings:
     model_name: str = "u2net"
-    # Padding cố định (pixel) — mặc định sát nền nhất
     padding_px: int = 10
     padding_top_px: int = 10
     padding_bottom_px: int = 10
     padding_left_px: int = 10
     padding_right_px: int = 10
     use_uniform_padding: bool = True
-    # Edge detection: % cạnh ảnh để coi là "sát biên"
-    edge_threshold_pct: float = 3.0
-    # Frame
+    edge_threshold_pct: float = 2.5
+    edge_gap_px: int = 5
     frame_index: int = 0
-    target_width: int = 0              # 0 = auto theo ảnh gốc
+    target_width: int = 0
     target_height: int = 0
-    # Quality
+    auto_output_size: bool = True
     png_compress: int = 9
-    min_size_px: int = 512             # Loại nếu CẢ HAI cạnh < giá trị này
-    subject_fill: float = 92.0         # % chủ thể chiếm canvas
+    min_size_px: int = 512
+    subject_fill: float = 92.0
     mask_threshold: int = 120
     white_bg: bool = True
     max_upscale: float = 2.0
-    # Folders
     output_folder: str = "Done"
     rejected_folder: str = "Loại bỏ"
-    # Output size mode
-    auto_output_size: bool = True      # True = theo ảnh gốc
+    cpu_limit: float = 20.0
+
+    def save(self, path: Path = SETTINGS_FILE):
+        try:
+            path.write_text(
+                json.dumps(asdict(self), indent=2, ensure_ascii=False),
+                encoding="utf-8")
+        except Exception:
+            pass
+
+    @classmethod
+    def load(cls, path: Path = SETTINGS_FILE) -> "CropSettings":
+        try:
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                valid = {f.name for f in cls.__dataclass_fields__.values()}
+                return cls(**{k: v for k, v in data.items() if k in valid})
+        except Exception:
+            pass
+        return cls()
+
+    @classmethod
+    def defaults(cls) -> "CropSettings":
+        return cls()
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║  SECTION 2 — THEME                                          ║
+# ║  SECTION 3 — THEME                                          ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 C = dict(
@@ -123,7 +145,7 @@ def build_qss() -> str:
     QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width:0; }}
     QGroupBox {{
         background:{C['bg2']}; border:1px solid {C['brd']};
-        border-radius:10px; margin-top:11px;
+        border-radius:9px; margin-top:10px;
         padding:14px 10px 8px 10px; font-weight:600; font-size:12px;
     }}
     QGroupBox::title {{
@@ -134,7 +156,7 @@ def build_qss() -> str:
     QPushButton {{
         background:{C['bg3']}; color:{C['t1']};
         border:1px solid {C['brd']}; border-radius:7px;
-        padding:7px 16px; font-weight:600; min-height:14px;
+        padding:7px 14px; font-weight:600; min-height:14px;
     }}
     QPushButton:hover {{ background:{C['bg_hov']}; border-color:{C['acc']}; }}
     QPushButton:pressed {{ background:{C['acc_d']}; }}
@@ -200,6 +222,12 @@ def build_qss() -> str:
         border:1px solid {C['brd']}; border-radius:7px; padding:6px;
         font-family:"Cascadia Code","Consolas",monospace; font-size:11px;
     }}
+    QLineEdit {{
+        background:{C['bg_in']}; color:{C['t1']};
+        border:1px solid {C['brd']}; border-radius:5px;
+        padding:5px 8px; font-size:12px;
+    }}
+    QLineEdit:focus {{ border-color:{C['brd_f']}; }}
     QSlider::groove:horizontal {{ background:{C['bg_in']}; height:5px; border-radius:2px; }}
     QSlider::handle:horizontal {{
         background:{C['acc']}; width:15px; height:15px;
@@ -227,43 +255,36 @@ def build_qss() -> str:
     }}
     QSplitter::handle {{ background:{C['brd']}; }}
     QSplitter::handle:vertical {{ height:3px; }}
+    QStatusBar {{
+        background:{C['bg2']}; color:{C['t2']};
+        border-top:1px solid {C['brd']}; font-size:11px; padding:2px 8px;
+    }}
+    QStatusBar QLabel {{
+        color:{C['t2']}; font-size:11px; padding:0 6px;
+        font-family:"Cascadia Code","Consolas",monospace;
+    }}
     """
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║  SECTION 3 — SYSTEM                                         ║
+# ║  SECTION 4 — SYSTEM                                         ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 @dataclass
-class SysProfile:
+class SysInfo:
     os_name: str = ""
     cpu_name: str = ""
     cores_p: int = 1
     cores_l: int = 1
     ram_gb: float = 0
-    ram_free: float = 0
-    gpu: str = "Không phát hiện"
+    gpu: str = "N/A"
     has_cuda: bool = False
-    rec_workers: int = 1
-    cpu_target: float = 20.0
-
-    def text(self) -> str:
-        return (
-            f"🖥  HĐH :  {self.os_name}\n"
-            f"⚙  CPU :  {self.cpu_name}\n"
-            f"🧵  Nhân:  {self.cores_p} vật lý / {self.cores_l} logic\n"
-            f"🧠  RAM :  {self.ram_gb:.1f} GB (trống {self.ram_free:.1f} GB)\n"
-            f"🎮  GPU :  {self.gpu}\n"
-            f"⚡  CUDA:  {'Có ✔' if self.has_cuda else 'Không'}"
-        )
 
 
-def detect_system(cpu_target=20.0) -> SysProfile:
-    mem = psutil.virtual_memory()
+def detect_system() -> SysInfo:
     cp = psutil.cpu_count(logical=False) or 1
     cl = psutil.cpu_count(logical=True) or 1
-    rt = mem.total / (1024 ** 3)
-    rf = mem.available / (1024 ** 3)
+    ram = psutil.virtual_memory().total / (1024 ** 3)
     cn = platform.processor() or ""
     if not cn and platform.system() == "Windows":
         try:
@@ -271,61 +292,43 @@ def detect_system(cpu_target=20.0) -> SysProfile:
                                capture_output=True, text=True, timeout=5)
             ls = [l.strip() for l in r.stdout.split("\n") if l.strip()]
             if len(ls) > 1: cn = ls[1]
-        except Exception: pass
-    cn = cn or "Không xác định"
-    gpu, cuda = "Không phát hiện", False
+        except Exception:
+            pass
+    gpu, cuda = "N/A", False
     try:
         import onnxruntime as ort
         if "CUDAExecutionProvider" in ort.get_available_providers():
-            cuda = True; gpu = "NVIDIA GPU (CUDA)"
+            cuda = True; gpu = "NVIDIA (CUDA)"
             try:
                 r = subprocess.run(
-                    ["nvidia-smi","--query-gpu=name","--format=csv,noheader,nounits"],
+                    ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader,nounits"],
                     capture_output=True, text=True, timeout=5)
                 if r.returncode == 0 and r.stdout.strip():
                     gpu = r.stdout.strip().split("\n")[0]
-            except Exception: pass
-    except ImportError: pass
-    wr = max(1, int(rf * 0.4 / 0.5))
-    wc = max(1, int(cp * cpu_target / 100))
-    return SysProfile(
+            except Exception:
+                pass
+    except ImportError:
+        pass
+    return SysInfo(
         os_name=f"{platform.system()} {platform.release()}",
-        cpu_name=cn, cores_p=cp, cores_l=cl,
-        ram_gb=rt, ram_free=rf, gpu=gpu, has_cuda=cuda,
-        rec_workers=max(1, min(wc, wr, cp)), cpu_target=cpu_target,
-    )
+        cpu_name=cn or "N/A", cores_p=cp, cores_l=cl,
+        ram_gb=ram, gpu=gpu, has_cuda=cuda)
+
+
+def lower_process_priority():
+    try:
+        p = psutil.Process(os.getpid())
+        if platform.system() == "Windows":
+            p.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+        else:
+            p.nice(10)
+    except Exception:
+        pass
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║  SECTION 4 — AI CROPPER ENGINE (Logic v2.5)                 ║
+# ║  SECTION 5 — AI CROPPER ENGINE                              ║
 # ╚══════════════════════════════════════════════════════════════╝
-#
-#  Pipeline:
-#  ┌──────────┐  ┌───────────┐  ┌──────────┐  ┌──────────┐
-#  │ Validate │─▶│  AI Mask  │─▶│  Refine  │─▶│  Smart   │
-#  │ max(w,h) │  │  3-layer  │  │  + Edge  │  │  Crop    │
-#  │ ≥ minpx  │  │  cleanup  │  │  Detect  │  │  + Place │
-#  └──────────┘  └───────────┘  └──────────┘  └──────────┘
-#       │ fail                                       │
-#       ▼                                            ▼
-#  ┌──────────┐                               ┌──────────┐
-#  │ Move to  │                               │ Save PNG │
-#  │ Rejected │                               │ Lossless │
-#  └──────────┘                               └──────────┘
-#
-#  Edge-Aware Logic:
-#  ┌─────────────────────┐
-#  │     padding_top     │  ← nếu subject KHÔNG sát biên trên
-#  │  ┌───────────────┐  │
-#  │  │               │  │
-#  │ p│   SUBJECT     │p │  ← padding_left / _right
-#  │  │               │  │
-#  │  └───────────────┘  │
-#  │     padding_bot     │  ← nếu subject KHÔNG sát biên dưới
-#  └─────────────────────┘
-#
-#  Nếu subject sát biên → padding = 0 ở cạnh đó
-#  (ví dụ: bàn, landscape, sản phẩm cắt sát mép)
 
 class SmartCropper:
     def __init__(self, settings: CropSettings | None = None):
@@ -342,72 +345,36 @@ class SmartCropper:
         self._session = None
         gc.collect()
 
-    # ─── AI Mask — 3 lớp làm sạch ───
     def _get_mask(self, img: PILImage.Image) -> np.ndarray:
-        """
-        Lớp 1: rembg raw mask (U²-Net / ISNet)
-        Lớp 2: Gaussian blur + adaptive threshold → mịn biên
-        Lớp 3: Morpho close/open + connected component → loại noise
-        """
         s = self.settings
-
-        # ── Lớp 1: AI raw mask ──
         raw = remove(img, session=self.session, only_mask=True)
         mask = np.array(raw)
         if mask.ndim == 3:
             mask = cv2.cvtColor(mask, cv2.COLOR_RGB2GRAY)
-
-        # ── Lớp 2: Smooth + Threshold ──
-        # Gaussian blur giảm răng cưa biên mask
         mask = cv2.GaussianBlur(mask, (5, 5), 0)
-
-        # Dùng 2 ngưỡng: chắc chắn subject + có thể subject
-        _, sure_fg = cv2.threshold(mask, s.mask_threshold, 255, cv2.THRESH_BINARY)
-        _, probable_fg = cv2.threshold(
-            mask, max(30, s.mask_threshold - 50), 255, cv2.THRESH_BINARY
-        )
-
-        # ── Lớp 3: Morphological cleanup ──
-        kern_sm = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        kern_lg = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-
-        # Đóng lỗ bên trong subject (sure_fg)
-        sure_fg = cv2.morphologyEx(sure_fg, cv2.MORPH_CLOSE, kern_lg, iterations=3)
-
-        # Mở để loại noise nhỏ
-        sure_fg = cv2.morphologyEx(sure_fg, cv2.MORPH_OPEN, kern_sm, iterations=1)
-
-        # Dùng probable_fg để mở rộng biên subject
-        # (tránh mất chi tiết mỏng như tóc, cành cây)
-        combined = cv2.bitwise_or(sure_fg, probable_fg)
-        combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kern_sm, iterations=1)
-
-        # Flood fill từ sure_fg vào combined → giữ vùng liên thông
-        # Chỉ giữ vùng trong combined mà overlap với sure_fg
-        n_sure, labels_sure, stats_sure, _ = cv2.connectedComponentsWithStats(sure_fg, 8)
-        n_comb, labels_comb, stats_comb, _ = cv2.connectedComponentsWithStats(combined, 8)
-
-        # Tìm component lớn nhất trong sure_fg
-        if n_sure <= 1:
-            return sure_fg
-
-        areas = stats_sure[1:, cv2.CC_STAT_AREA]
-        main_label = 1 + int(np.argmax(areas))
-        main_mask = (labels_sure == main_label).astype(np.uint8) * 255
-
-        # Mở rộng: lấy vùng combined mà overlap với main subject
-        if n_comb > 1:
-            overlap_labels = set(np.unique(labels_comb[main_mask > 0]))
-            overlap_labels.discard(0)
-            expanded = np.zeros_like(combined)
-            for lbl in overlap_labels:
-                expanded[labels_comb == lbl] = 255
-            # Merge
+        _, sure = cv2.threshold(mask, s.mask_threshold, 255, cv2.THRESH_BINARY)
+        _, prob = cv2.threshold(
+            mask, max(25, s.mask_threshold - 55), 255, cv2.THRESH_BINARY)
+        ks = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        kl = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        sure = cv2.morphologyEx(sure, cv2.MORPH_CLOSE, kl, iterations=3)
+        sure = cv2.morphologyEx(sure, cv2.MORPH_OPEN, ks, iterations=1)
+        combo = cv2.bitwise_or(sure, prob)
+        combo = cv2.morphologyEx(combo, cv2.MORPH_CLOSE, ks, iterations=1)
+        n_s, lb_s, st_s, _ = cv2.connectedComponentsWithStats(sure, 8)
+        if n_s <= 1:
+            return sure
+        main_lbl = 1 + int(np.argmax(st_s[1:, cv2.CC_STAT_AREA]))
+        main_mask = (lb_s == main_lbl).astype(np.uint8) * 255
+        n_c, lb_c, _, _ = cv2.connectedComponentsWithStats(combo, 8)
+        if n_c > 1:
+            overlap = set(np.unique(lb_c[main_mask > 0]))
+            overlap.discard(0)
+            expanded = np.zeros_like(combo)
+            for lbl in overlap:
+                expanded[lb_c == lbl] = 255
             final = cv2.bitwise_or(main_mask, expanded)
-            # Clean lần cuối
-            final = cv2.morphologyEx(final, cv2.MORPH_CLOSE, kern_sm, iterations=1)
-            return final
-
+            return cv2.morphologyEx(final, cv2.MORPH_CLOSE, ks, iterations=1)
         return main_mask
 
     @staticmethod
@@ -419,49 +386,59 @@ class SmartCropper:
         y2, x2 = coords.max(axis=0)
         return int(x1), int(y1), int(x2), int(y2)
 
-    def _detect_edges(self, x1, y1, x2, y2, img_w, img_h):
-        """
-        Phát hiện cạnh nào của subject sát biên ảnh.
-        Trả dict: {top, bottom, left, right} = True nếu sát biên.
-        """
-        threshold = self.settings.edge_threshold_pct / 100.0
-        th_x = int(img_w * threshold)
-        th_y = int(img_h * threshold)
-        return dict(
-            top=y1 <= th_y,
-            bottom=y2 >= img_h - 1 - th_y,
-            left=x1 <= th_x,
-            right=x2 >= img_w - 1 - th_x,
-        )
+    def _detect_edges(self, mask, x1, y1, x2, y2, img_w, img_h):
+        s = self.settings
+        gap = s.edge_gap_px
+        band_y = max(3, int(img_h * s.edge_threshold_pct / 100))
+        band_x = max(3, int(img_w * s.edge_threshold_pct / 100))
+        min_px = max(3, int(min(img_w, img_h) * 0.003))
+
+        mask_top = int(np.sum(mask[0:band_y, :] > 0)) > min_px
+        mask_bot = int(np.sum(mask[img_h - band_y:, :] > 0)) > min_px
+        mask_lft = int(np.sum(mask[:, 0:band_x] > 0)) > min_px
+        mask_rgt = int(np.sum(mask[:, img_w - band_x:] > 0)) > min_px
+
+        gap_top = y1 <= gap
+        gap_bot = y2 >= img_h - 1 - gap
+        gap_lft = x1 <= gap
+        gap_rgt = x2 >= img_w - 1 - gap
+
+        edges = dict(
+            top=mask_top or gap_top,
+            bottom=mask_bot or gap_bot,
+            left=mask_lft or gap_lft,
+            right=mask_rgt or gap_rgt)
+
+        if edges["top"] and not gap_top and y1 > band_y * 3:
+            edges["top"] = False
+        if edges["bottom"] and not gap_bot and y2 < img_h - 1 - band_y * 3:
+            edges["bottom"] = False
+        if edges["left"] and not gap_lft and x1 > band_x * 3:
+            edges["left"] = False
+        if edges["right"] and not gap_rgt and x2 < img_w - 1 - band_x * 3:
+            edges["right"] = False
+        return edges
 
     def _calc_output_size(self, orig_w, orig_h):
-        """Tính canvas đầu ra — mặc định theo ảnh gốc."""
         s = self.settings
-
-        # Nếu auto → giữ nguyên kích thước ảnh gốc
         if s.auto_output_size or (s.target_width <= 0 and s.target_height <= 0):
-            base_w, base_h = orig_w, orig_h
+            bw, bh = orig_w, orig_h
         else:
-            base_w = s.target_width if s.target_width > 0 else orig_w
-            base_h = s.target_height if s.target_height > 0 else orig_h
-
+            bw = s.target_width if s.target_width > 0 else orig_w
+            bh = s.target_height if s.target_height > 0 else orig_h
         idx = s.frame_index
         if idx < 0 or idx >= len(FRAME_OPTIONS):
             idx = 0
         _, rw, rh = FRAME_OPTIONS[idx]
-
         if rw == 0 and rh == 0:
-            # Auto: giữ tỷ lệ gốc
-            return base_w, base_h
+            return bw, bh
         elif rw == -1 and rh == -1:
-            # Custom: dùng base_w × base_h
-            return base_w, base_h
+            return bw, bh
         else:
-            # Preset ratio: fit vào base size
-            scale = min(base_w / rw, base_h / rh)
-            return max(256, int(rw * scale)), max(256, int(rh * scale))
+            sc = min(bw / rw, bh / rh)
+            return max(256, int(rw * sc)), max(256, int(rh * sc))
 
-    def _move_rejected(self, path: Path, reason: str) -> Path:
+    def _move_rejected(self, path: Path) -> Path:
         d = path.parent / self.settings.rejected_folder
         d.mkdir(exist_ok=True)
         dest = d / path.name
@@ -478,176 +455,141 @@ class SmartCropper:
             status="error", reason="", input_path=image_path,
             output_path=None, moved_path=None,
             original_size=(0, 0), subject_size=(0, 0),
-            thumbnail=None, edges_near=None,
-        )
-
+            thumbnail=None, edges=None)
         try:
-            # ── 1. LOAD ──
             img = PILImage.open(image_path).convert("RGB")
             w, h = img.size
             r["original_size"] = (w, h)
 
-            # ── 2. REJECT: chỉ khi CẢ HAI cạnh < min ──
             if max(w, h) < s.min_size_px:
                 img.close(); del img
-                dest = self._move_rejected(
-                    image_path, f"Cả 2 cạnh < {s.min_size_px}px ({w}×{h})"
-                )
+                dest = self._move_rejected(image_path)
                 r.update(status="rejected",
-                         reason=f"Quá nhỏ ({w}×{h}) → đã chuyển",
+                         reason=f"Quá nhỏ {w}×{h} (max<{s.min_size_px})",
                          moved_path=dest)
                 return r
 
-            # ── 3. AI MASK ──
             mask = self._get_mask(img)
             bbox = self._bbox(mask)
-
             if bbox is None:
-                r.update(status="skipped", reason="Không phát hiện chủ thể")
-                return r
+                r.update(status="skipped", reason="Không tìm thấy chủ thể")
+                del mask; return r
 
             x1, y1, x2, y2 = bbox
             sw, sh = x2 - x1, y2 - y1
             r["subject_size"] = (sw, sh)
 
-            # Subject quá nhỏ? (cả 2 cạnh subject < min)
             if max(sw, sh) < s.min_size_px:
                 img.close(); del img, mask
-                dest = self._move_rejected(
-                    image_path, f"Chủ thể quá nhỏ ({sw}×{sh})"
-                )
+                dest = self._move_rejected(image_path)
                 r.update(status="rejected",
-                         reason=f"Chủ thể nhỏ ({sw}×{sh}) → đã chuyển",
+                         reason=f"Chủ thể nhỏ {sw}×{sh}",
                          moved_path=dest)
                 return r
 
-            # ── 4. EDGE-AWARE PADDING ──
-            edges = self._detect_edges(x1, y1, x2, y2, w, h)
-            r["edges_near"] = edges
+            edges = self._detect_edges(mask, x1, y1, x2, y2, w, h)
+            r["edges"] = edges
 
             if s.use_uniform_padding:
-                p = s.padding_px
-                pt = 0 if edges["top"] else p
-                pb = 0 if edges["bottom"] else p
-                pl = 0 if edges["left"] else p
-                pr = 0 if edges["right"] else p
+                pt = pb = pl = pr = s.padding_px
             else:
-                pt = 0 if edges["top"] else s.padding_top_px
-                pb = 0 if edges["bottom"] else s.padding_bottom_px
-                pl = 0 if edges["left"] else s.padding_left_px
-                pr = 0 if edges["right"] else s.padding_right_px
+                pt, pb = s.padding_top_px, s.padding_bottom_px
+                pl, pr = s.padding_left_px, s.padding_right_px
 
-            # Tính vùng crop (subject + padding, clamp vào biên ảnh)
-            cx1 = max(0, x1 - pl)
-            cy1 = max(0, y1 - pt)
-            cx2 = min(w, x2 + pr)
-            cy2 = min(h, y2 + pb)
-
-            # Nếu cạnh sát biên → crop tới tận biên ảnh gốc (giữ nguyên content)
-            if edges["top"]:    cy1 = 0
-            if edges["bottom"]: cy2 = h
-            if edges["left"]:   cx1 = 0
-            if edges["right"]:  cx2 = w
+            cy1 = 0 if edges["top"] else max(0, y1 - pt)
+            cy2 = h if edges["bottom"] else min(h, y2 + pb)
+            cx1 = 0 if edges["left"] else max(0, x1 - pl)
+            cx2 = w if edges["right"] else min(w, x2 + pr)
 
             crop = img.crop((cx1, cy1, cx2, cy2))
             cw, ch = crop.size
+            del mask
 
-            # ── 5. OUTPUT SIZE ──
             tw, th = self._calc_output_size(w, h)
 
-            # ── 6. SCALE + PLACE trên canvas ──
             fill = s.subject_fill / 100.0
-            uw, uh = int(tw * fill), int(th * fill)
-            scale = min(uw / cw, uh / ch, s.max_upscale)
-            nw = max(1, int(cw * scale))
-            nh = max(1, int(ch * scale))
-
+            scale = min(
+                int(tw * fill) / max(cw, 1),
+                int(th * fill) / max(ch, 1),
+                s.max_upscale)
+            nw, nh = max(1, int(cw * scale)), max(1, int(ch * scale))
             resized = crop.resize((nw, nh), PILImage.LANCZOS)
+            del crop
 
-            if s.white_bg:
-                canvas = PILImage.new("RGB", (tw, th), (255, 255, 255))
-            else:
-                canvas = PILImage.new("RGBA", (tw, th), (0, 0, 0, 0))
+            canvas = PILImage.new(
+                "RGB" if s.white_bg else "RGBA", (tw, th),
+                (255, 255, 255) if s.white_bg else (0, 0, 0, 0))
 
-            # Smart placement: dựa vào cạnh sát biên
-            # Default: center
-            px = (tw - nw) // 2
-            py = (th - nh) // 2
-
-            # Nếu sát biên nào → dính vào biên đó
+            px, py = (tw - nw) // 2, (th - nh) // 2
             if edges["top"] and not edges["bottom"]:
                 py = 0
             elif edges["bottom"] and not edges["top"]:
                 py = th - nh
             elif not edges["top"] and not edges["bottom"]:
-                # Hơi lệch lên 2% cho tự nhiên (product photo)
                 py = max(0, py - int(th * 0.02))
-
             if edges["left"] and not edges["right"]:
                 px = 0
             elif edges["right"] and not edges["left"]:
                 px = tw - nw
 
             canvas.paste(resized, (px, py))
+            del resized, img
 
-            # ── 7. SAVE ──
             out_dir = image_path.parent / s.output_folder
             out_dir.mkdir(exist_ok=True)
             out = out_dir / f"{image_path.stem}.png"
             canvas.save(out, format="PNG", compress_level=s.png_compress)
 
-            # ── 8. THUMBNAIL ──
+            # ── FIX: tạo thumbnail bytes → thread-safe ──
             thumb = canvas.copy()
             thumb.thumbnail((THUMB_PX, THUMB_PX), PILImage.LANCZOS)
+            # Convert sang bytes ngay tại worker thread
+            # → UI thread chỉ cần decode, không phụ thuộc PIL object
+            thumb_rgb = thumb.convert("RGB")
+            thumb_data = np.array(thumb_rgb).copy()  # copy() = own memory
+            del canvas, thumb, thumb_rgb
 
-            del resized, crop, mask, canvas, img
-
-            edge_info = ", ".join(
-                k for k, v in edges.items() if v
-            ) or "không"
+            edge_vn = {"top": "trên", "bottom": "dưới",
+                       "left": "trái", "right": "phải"}
+            e_str = ", ".join(edge_vn[k] for k, v in edges.items() if v) or "không"
 
             r.update(
                 status="success",
-                reason=(
-                    f"{sw}×{sh} → {nw}×{nh} (×{scale:.1f}) "
-                    f"Canvas {tw}×{th} │ Sát biên: {edge_info}"
-                ),
-                output_path=out, thumbnail=thumb,
+                reason=f"{sw}×{sh}→{nw}×{nh} (×{scale:.1f}) Out:{tw}×{th} Biên:{e_str}",
+                output_path=out,
+                thumbnail=thumb_data,  # numpy array, thread-safe
             )
             return r
-
         except Exception as e:
             r.update(status="error", reason=str(e))
             return r
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║  SECTION 5 — BATCH WORKER                                   ║
+# ║  SECTION 6 — BATCH WORKER                                   ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 class BatchWorker(QThread):
+    # ── FIX: thumbnail_ready signal riêng để tránh race condition ──
     sig_progress = pyqtSignal(int, int, dict)
     sig_file_start = pyqtSignal(int, str)
     sig_finished = pyqtSignal(list)
     sig_log = pyqtSignal(str)
     sig_sysload = pyqtSignal(float, float)
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._mx = QMutex()
-        self._cond = QWaitCondition()
+    def __init__(self):
+        super().__init__()
+        self._mx = QMutex(); self._cond = QWaitCondition()
         self._paused = self._cancelled = False
         self.file_list: list[Path] = []
         self.settings = CropSettings()
-        self.cpu_limit = 20.0
         self._cropper: SmartCropper | None = None
 
     def set_folder(self, path: str):
-        folder = Path(path)
+        f = Path(path)
         self.file_list = sorted(
-            f for f in folder.iterdir()
-            if f.is_file() and f.suffix.lower() in SUPPORTED_EXT
-        )
+            x for x in f.iterdir()
+            if x.is_file() and x.suffix.lower() in SUPPORTED_EXT)
 
     def pause(self):
         self._mx.lock(); self._paused = True; self._mx.unlock()
@@ -660,7 +602,7 @@ class BatchWorker(QThread):
         self._mx.lock(); self._cancelled = True; self._paused = False
         self._cond.wakeAll(); self._mx.unlock()
 
-    def release_resources(self):
+    def release(self):
         if self._cropper:
             self._cropper.release(); self._cropper = None
         gc.collect()
@@ -672,30 +614,39 @@ class BatchWorker(QThread):
         self._mx.unlock()
 
     def _throttle(self):
-        cpu = psutil.cpu_percent(interval=0.15)
+        cpu = psutil.cpu_percent(interval=0.1)
         ram = psutil.virtual_memory().percent
         self.sig_sysload.emit(cpu, ram)
-        if cpu > self.cpu_limit:
-            ov = (cpu - self.cpu_limit) / 100.0
-            sl = min(2.5, 0.2 + ov * 4.0)
-            self.sig_log.emit(
-                f"  🌡️ CPU {cpu:.0f}% > {self.cpu_limit:.0f}% → chờ {sl:.1f}s"
-            )
+        if ram > RAM_THROTTLE_PCT:
+            self.sig_log.emit(f"  ⚠️ RAM {ram:.0f}% → giải phóng bộ nhớ...")
+            gc.collect()
+            time.sleep(2.0)
+            ram = psutil.virtual_memory().percent
+            if ram > RAM_THROTTLE_PCT:
+                self.sig_log.emit(f"  ⚠️ RAM vẫn {ram:.0f}% → chờ 5s...")
+                time.sleep(5.0)
+        lim = self.settings.cpu_limit
+        if cpu > lim:
+            sl = min(2.5, 0.2 + (cpu - lim) / 100.0 * 4.0)
+            self.sig_log.emit(f"  🌡️ CPU {cpu:.0f}%>{lim:.0f}% → chờ {sl:.1f}s")
             time.sleep(sl)
 
     def run(self):
         self._cancelled = self._paused = False
         total = len(self.file_list)
         if total == 0:
-            self.sig_log.emit("⚠️  Không có ảnh")
+            self.sig_log.emit("⚠️ Không có ảnh")
             self.sig_finished.emit([]); return
 
+        lower_process_priority()
         self.sig_log.emit(
-            f"🚀 Bắt đầu: {total} ảnh │ Model: {self.settings.model_name} │ "
-            f"CPU ≤ {self.cpu_limit:.0f}%\n"
+            f"🚀 Bắt đầu: {total:,} ảnh │ Model: {self.settings.model_name} │ "
+            f"CPU ≤ {self.settings.cpu_limit:.0f}%"
+            + ("\n   💡 Batch lớn — tối ưu RAM đang bật" if total > 500 else "")
+            + "\n"
         )
+
         self._cropper = SmartCropper(self.settings)
-        results = []
         cnt = dict(success=0, skipped=0, rejected=0, error=0)
         t0 = time.time()
 
@@ -703,65 +654,82 @@ class BatchWorker(QThread):
             if self._cancelled:
                 self.sig_log.emit("🛑 Đã huỷ!"); break
             self._check_pause()
-            if self._cancelled: break
+            if self._cancelled:
+                break
             self._throttle()
             self.sig_file_start.emit(i, fp.name)
 
             res = self._cropper.process(fp)
-            results.append(res)
             cnt[res["status"]] = cnt.get(res["status"], 0) + 1
 
             icon = dict(success="✅", skipped="⏭️",
                         rejected="📦", error="❌").get(res["status"], "❓")
-            self.sig_log.emit(
-                f"{icon} [{i+1}/{total}]  {fp.name}\n    └─ {res['reason']}"
-            )
+
+            if total > 1000:
+                if i % 50 == 0 or res["status"] != "success":
+                    self.sig_log.emit(
+                        f"{icon} [{i+1:,}/{total:,}] {fp.name} — {res['reason'][:60]}")
+            else:
+                self.sig_log.emit(
+                    f"{icon} [{i+1}/{total}] {fp.name}\n   └─ {res['reason']}")
+
+            # ── FIX: emit TRƯỚC, không chỉnh res sau emit ──
             self.sig_progress.emit(i + 1, total, res)
 
-        el = time.time() - t0
+            # ── FIX: GC thumbnail SAU khi UI đã nhận (sleep nhỏ cho slot chạy) ──
+            # Không cần sleep vì thumbnail giờ là numpy array (copy sẵn)
+            # Worker không giữ reference nào tới PIL object
+
+            if (i + 1) % GC_EVERY_N == 0:
+                gc.collect()
+
+        elapsed = time.time() - t0
         self.sig_log.emit(
-            f"\n{'═'*54}\n🏁 HOÀN TẤT — {el:.1f}s (~{el/max(len(results),1):.2f}s/ảnh)\n"
-            f"   ✅ Thành công: {cnt['success']}   ⏭️ Bỏ qua: {cnt['skipped']}\n"
-            f"   📦 Loại bỏ: {cnt['rejected']}     ❌ Lỗi: {cnt['error']}\n{'═'*54}"
-        )
-        self._cropper.release(); self._cropper = None
-        gc.collect()
-        self.sig_finished.emit(results)
+            f"\n{'═' * 54}\n🏁 HOÀN TẤT — {elapsed:.1f}s "
+            f"(~{elapsed / max(sum(cnt.values()), 1):.2f}s/ảnh)\n"
+            f"  ✅ Thành công: {cnt['success']:,}  ⏭️ Bỏ qua: {cnt['skipped']:,}\n"
+            f"  📦 Loại bỏ: {cnt['rejected']:,}   ❌ Lỗi: {cnt['error']:,}\n"
+            f"  📊 Tổng: {sum(cnt.values()):,}/{total:,}\n{'═' * 54}")
+
+        self._cropper.release(); self._cropper = None; gc.collect()
+        self.sig_finished.emit([cnt])
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║  SECTION 6 — WIDGETS                                        ║
+# ║  SECTION 7 — WIDGETS                                        ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 class SliderRow(QWidget):
     valueChanged = pyqtSignal(float)
+
     def __init__(self, label, lo, hi, default, step=1,
-                 suffix="", decimals=0, tip="", label_w=130, parent=None):
+                 suffix="", decimals=0, tip="", lw=125, parent=None):
         super().__init__(parent)
         self._m = 10 ** decimals; self._s = suffix; self._d = decimals
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(0, 1, 0, 1); lay.setSpacing(5)
-        lbl = QLabel(label); lbl.setFixedWidth(label_w)
+        lay.setContentsMargins(0, 1, 0, 1); lay.setSpacing(4)
+        lbl = QLabel(label); lbl.setFixedWidth(lw)
         if tip: lbl.setToolTip(tip)
         lay.addWidget(lbl)
         self.slider = QSlider(Qt.Orientation.Horizontal)
-        self.slider.setMinimum(int(lo*self._m))
-        self.slider.setMaximum(int(hi*self._m))
-        self.slider.setValue(int(default*self._m))
-        self.slider.setSingleStep(int(step*self._m))
+        self.slider.setMinimum(int(lo * self._m))
+        self.slider.setMaximum(int(hi * self._m))
+        self.slider.setValue(int(default * self._m))
+        self.slider.setSingleStep(int(step * self._m))
         lay.addWidget(self.slider, 1)
-        self.vlbl = QLabel()
-        self.vlbl.setFixedWidth(48)
-        self.vlbl.setAlignment(Qt.AlignmentFlag.AlignRight|Qt.AlignmentFlag.AlignVCenter)
-        self.vlbl.setStyleSheet(f"color:{C['acc']};font-weight:600;font-size:12px;")
+        self.vlbl = QLabel(); self.vlbl.setFixedWidth(46)
+        self.vlbl.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.vlbl.setStyleSheet(f"color:{C['acc']};font-weight:600;font-size:11px;")
         lay.addWidget(self.vlbl)
         self._upd(self.slider.value())
         self.slider.valueChanged.connect(self._upd)
 
     def _upd(self, raw):
         v = raw / self._m
-        t = f"{int(v)}{self._s}" if self._d == 0 else f"{v:.{self._d}f}{self._s}"
-        self.vlbl.setText(t); self.valueChanged.emit(v)
+        self.vlbl.setText(
+            f"{int(v)}{self._s}" if self._d == 0 else f"{v:.{self._d}f}{self._s}")
+        self.valueChanged.emit(v)
 
     def value(self): return self.slider.value() / self._m
     def setValue(self, v): self.slider.setValue(int(v * self._m))
@@ -769,11 +737,11 @@ class SliderRow(QWidget):
 
 class SpinRow(QWidget):
     def __init__(self, label, lo, hi, default,
-                 suffix="", tip="", label_w=130, parent=None):
+                 suffix="", tip="", lw=125, parent=None):
         super().__init__(parent)
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(0, 1, 0, 1); lay.setSpacing(5)
-        lbl = QLabel(label); lbl.setFixedWidth(label_w)
+        lay.setContentsMargins(0, 1, 0, 1); lay.setSpacing(4)
+        lbl = QLabel(label); lbl.setFixedWidth(lw)
         if tip: lbl.setToolTip(tip)
         lay.addWidget(lbl)
         self.spin = QSpinBox()
@@ -785,6 +753,20 @@ class SpinRow(QWidget):
     def setValue(self, v): self.spin.setValue(v)
 
 
+class TextRow(QWidget):
+    def __init__(self, label, default="", lw=125, parent=None):
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 1, 0, 1); lay.setSpacing(4)
+        l = QLabel(label); l.setFixedWidth(lw)
+        lay.addWidget(l)
+        self.le = QLineEdit(default)
+        lay.addWidget(self.le, 1)
+
+    def value(self): return self.le.text().strip()
+    def setValue(self, v): self.le.setText(v)
+
+
 class Sep(QFrame):
     def __init__(self):
         super().__init__()
@@ -794,14 +776,15 @@ class Sep(QFrame):
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║  SECTION 7 — DROP ZONE                                      ║
+# ║  SECTION 8 — DROP ZONE                                      ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 class DropZone(QWidget):
     folder_dropped = pyqtSignal(str)
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setAcceptDrops(True); self.setFixedHeight(110)
+
+    def __init__(self):
+        super().__init__()
+        self.setAcceptDrops(True); self.setFixedHeight(100)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._hov = False; self._path = ""
 
@@ -809,26 +792,23 @@ class DropZone(QWidget):
         p = QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing)
         m, w, h = 4, self.width(), self.height()
         bg = QColor(C["bg_hov"] if self._hov else C["dz_bg"])
-        pp = QPainterPath()
-        pp.addRoundedRect(m, m, w-2*m, h-2*m, 11, 11)
+        pp = QPainterPath(); pp.addRoundedRect(m, m, w - 2*m, h - 2*m, 10, 10)
         p.fillPath(pp, bg)
         pen = QPen(QColor(C["acc"]))
         pen.setWidth(3 if self._hov else 2)
         pen.setStyle(Qt.PenStyle.SolidLine if self._hov else Qt.PenStyle.DashLine)
-        p.setPen(pen)
-        p.drawRoundedRect(m, m, w-2*m, h-2*m, 11, 11)
+        p.setPen(pen); p.drawRoundedRect(m, m, w - 2*m, h - 2*m, 10, 10)
         p.setPen(QColor(C["acc"] if self._hov else C["t2"]))
-        p.setFont(QFont("Segoe UI Emoji", 24))
-        p.drawText(0, 0, w, int(h*0.58),
-                   Qt.AlignmentFlag.AlignHCenter|Qt.AlignmentFlag.AlignBottom, "📂")
+        p.setFont(QFont("Segoe UI Emoji", 22))
+        p.drawText(0, 0, w, int(h * 0.58),
+                   Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom, "📂")
         p.setFont(QFont("Segoe UI", 10, QFont.Weight.DemiBold))
         if self._path:
-            p.setPen(QColor(C["ok"]))
-            txt = f"✔  {Path(self._path).name}"
+            p.setPen(QColor(C["ok"])); txt = f"✔  {Path(self._path).name}"
         else:
-            txt = "Kéo thư mục ảnh vào đây  —  hoặc nhấn để chọn"
-        p.drawText(10, int(h*0.55), w-20, int(h*0.38),
-                   Qt.AlignmentFlag.AlignHCenter|Qt.AlignmentFlag.AlignTop, txt)
+            txt = "Kéo thư mục ảnh vào đây — hoặc nhấn để chọn"
+        p.drawText(8, int(h * 0.55), w - 16, int(h * 0.4),
+                   Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, txt)
         p.end()
 
     def dragEnterEvent(self, e):
@@ -837,7 +817,9 @@ class DropZone(QWidget):
                 if Path(u.toLocalFile()).is_dir():
                     e.acceptProposedAction(); self._hov = True; self.update(); return
         e.ignore()
+
     def dragLeaveEvent(self, _): self._hov = False; self.update()
+
     def dropEvent(self, e):
         self._hov = False
         for u in e.mimeData().urls():
@@ -845,367 +827,456 @@ class DropZone(QWidget):
             if Path(p).is_dir():
                 self._path = p; self.folder_dropped.emit(p); self.update(); return
         self.update()
+
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
             d = QFileDialog.getExistingDirectory(self, "Chọn thư mục chứa ảnh")
             if d: self._path = d; self.folder_dropped.emit(d); self.update()
+
     def reset(self): self._path = ""; self.update()
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║  SECTION 8 — THUMBNAIL GRID                                 ║
+# ║  SECTION 9 — THUMBNAIL GRID (FIXED)                         ║
 # ╚══════════════════════════════════════════════════════════════╝
+#
+#  ── FIX SUMMARY ──
+#
+#  BUG 1: populate_names() không load ảnh gốc
+#  FIX 1: Batch nhỏ (≤500) → load source thumbnail qua QPixmap
+#         Batch lớn (>500) → không load, chỉ hiện tên
+#
+#  BUG 2: set_px_pil nhận numpy array thay vì PIL (do cropper fix)
+#  FIX 2: Thêm set_px_numpy() nhận numpy array trực tiếp
+#         Thêm set_px_path() load từ file path
+#
+#  BUG 3: Rolling window relayout tính row sai khi có header
+#  FIX 3: _data_row_offset() method tính chính xác
 
 class ThumbCard(QFrame):
     _ST = {
-        "success":("✅ Xong",C["ok"]), "skipped":("⏭️ Bỏ qua",C["skip"]),
-        "rejected":("📦 Loại",C["warn"]), "error":("❌ Lỗi",C["err"]),
-        "processing":("⏳ ...",C["acc"]), "waiting":("⏳ Chờ",C["t_off"]),
+        "success": ("✅ Xong", C["ok"]),
+        "skipped": ("⏭️ Bỏ qua", C["skip"]),
+        "rejected": ("📦 Loại", C["warn"]),
+        "error": ("❌ Lỗi", C["err"]),
+        "processing": ("⏳", C["acc"]),
+        "waiting": ("", C["t_off"]),
     }
-    def __init__(self, name="", parent=None):
-        super().__init__(parent)
-        self.setFixedSize(THUMB_PX+16, THUMB_PX+48)
-        self._setb(C["brd"])
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(4, 4, 4, 2); lay.setSpacing(1)
-        lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.img = QLabel()
-        self.img.setFixedSize(THUMB_PX, THUMB_PX)
-        self.img.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.img.setStyleSheet(f"background:{C['bg_in']};border-radius:5px;")
-        lay.addWidget(self.img, 0, Qt.AlignmentFlag.AlignCenter)
-        self.nlbl = QLabel(name[:20] if len(name)<=20 else name[:9]+"…"+name[-8:])
-        self.nlbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.nlbl.setMaximumWidth(THUMB_PX)
-        self.nlbl.setStyleSheet(f"color:{C['t2']};font-size:9px;")
-        lay.addWidget(self.nlbl, 0, Qt.AlignmentFlag.AlignCenter)
-        self.slbl = QLabel("")
-        self.slbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lay.addWidget(self.slbl, 0, Qt.AlignmentFlag.AlignCenter)
 
-    def _setb(self, col):
+    def __init__(self, name=""):
+        super().__init__()
+        self.setFixedSize(THUMB_PX + 14, THUMB_PX + 44)
+        self._set_border(C["brd"])
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(3, 3, 3, 2); lay.setSpacing(1)
+        lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.img_label = QLabel()
+        self.img_label.setFixedSize(THUMB_PX, THUMB_PX)
+        self.img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.img_label.setStyleSheet(
+            f"background:{C['bg_in']};border-radius:5px;")
+        lay.addWidget(self.img_label, 0, Qt.AlignmentFlag.AlignCenter)
+
+        n = name if len(name) <= 18 else name[:8] + "…" + name[-7:]
+        self.name_label = QLabel(n)
+        self.name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.name_label.setMaximumWidth(THUMB_PX)
+        self.name_label.setStyleSheet(f"color:{C['t2']};font-size:9px;")
+        lay.addWidget(self.name_label, 0, Qt.AlignmentFlag.AlignCenter)
+
+        self.status_label = QLabel("")
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(self.status_label, 0, Qt.AlignmentFlag.AlignCenter)
+
+    def _set_border(self, col):
         self.setStyleSheet(
-            f"ThumbCard{{background:{C['th_bg']};border:2px solid {col};border-radius:9px;}}"
-        )
-    def set_px_path(self, path):
-        px = QPixmap(str(path))
+            f"ThumbCard{{background:{C['th_bg']};"
+            f"border:2px solid {col};border-radius:8px;}}")
+
+    def set_px_path(self, file_path: str):
+        """Load thumbnail từ file path (ảnh gốc)."""
+        px = QPixmap(file_path)
         if not px.isNull():
-            self.img.setPixmap(px.scaled(
-                THUMB_PX-4,THUMB_PX-4,
+            self.img_label.setPixmap(px.scaled(
+                THUMB_PX - 4, THUMB_PX - 4,
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation))
-    def set_px_pil(self, pil):
-        im = pil.convert("RGB"); d = np.array(im)
-        h, w, ch = d.shape
-        qi = QImage(d.tobytes(), w, h, w*ch, QImage.Format.Format_RGB888)
-        self.img.setPixmap(QPixmap.fromImage(qi).scaled(
-            THUMB_PX-4,THUMB_PX-4,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation))
-    def set_status(self, status, detail=""):
+
+    def set_px_numpy(self, arr: np.ndarray):
+        """
+        Load thumbnail từ numpy array (RGB, uint8).
+        Thread-safe: numpy array đã copy() trong worker.
+        """
+        if arr is None or arr.size == 0:
+            return
+        h, w = arr.shape[:2]
+        if arr.ndim == 3:
+            ch = arr.shape[2]
+            fmt = QImage.Format.Format_RGB888 if ch == 3 else QImage.Format.Format_RGBA8888
+            bpl = w * ch
+        else:
+            fmt = QImage.Format.Format_Grayscale8
+            bpl = w
+
+        qimg = QImage(arr.data, w, h, bpl, fmt)
+        pixmap = QPixmap.fromImage(qimg)
+        if not pixmap.isNull():
+            self.img_label.setPixmap(pixmap.scaled(
+                THUMB_PX - 4, THUMB_PX - 4,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation))
+
+    def set_status(self, status: str, detail: str = ""):
         txt, col = self._ST.get(status, ("?", C["t2"]))
-        self.slbl.setText(detail[:26] if detail else txt)
-        self.slbl.setStyleSheet(f"color:{col};font-size:9px;font-weight:600;")
-        bm = dict(success=C["ok"],error=C["err"],skipped=C["skip"],
-                   rejected=C["warn"],processing=C["acc"])
-        self._setb(bm.get(status, C["brd"]))
+        self.status_label.setText(detail[:24] if detail else txt)
+        self.status_label.setStyleSheet(
+            f"color:{col};font-size:9px;font-weight:600;")
+        bm = dict(success=C["ok"], error=C["err"], skipped=C["skip"],
+                   rejected=C["warn"], processing=C["acc"])
+        self._set_border(bm.get(status, C["brd"]))
 
 
 class ThumbGrid(QScrollArea):
-    def __init__(self, parent=None):
-        super().__init__(parent)
+    """
+    Thumbnail grid — 2 chế độ:
+
+    ≤ MAX_GRID_CARDS: TẤT CẢ cards, load source thumbnail
+    > MAX_GRID_CARDS: Rolling window, chỉ giữ N cards gần nhất
+    """
+
+    def __init__(self):
+        super().__init__()
         self.setWidgetResizable(True)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self._box = QWidget()
-        self._grid = QGridLayout(self._box)
-        self._grid.setContentsMargins(4,4,4,4); self._grid.setSpacing(5)
-        self.setWidget(self._box)
-        self._cards: list[ThumbCard] = []; self._cols = 4
+
+        self._container = QWidget()
+        self._grid = QGridLayout(self._container)
+        self._grid.setContentsMargins(4, 4, 4, 4)
+        self._grid.setSpacing(4)
+        self.setWidget(self._container)
+
+        self._cards: list[ThumbCard] = []
+        self._cols = 4
+        self._total = 0
+        self._is_large = False
+
+        # Header cho batch lớn
+        self._header = QLabel("")
+        self._header.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._header.setStyleSheet(
+            f"color:{C['acc']};font-size:11px;font-weight:600;"
+            f"padding:4px;background:{C['bg_in']};"
+            f"border:1px solid {C['brd']};border-radius:6px;")
+        self._header.setVisible(False)
+
+    def _row_offset(self) -> int:
+        """Số row bị chiếm bởi header (0 hoặc 1)."""
+        return 1 if self._header.isVisible() else 0
 
     def clear(self):
-        for c in self._cards: self._grid.removeWidget(c); c.deleteLater()
+        """Xoá toàn bộ grid."""
+        # Remove header
+        self._grid.removeWidget(self._header)
+        self._header.setVisible(False)
+        self._header.setParent(None)
+
+        # Remove all cards
+        for c in self._cards:
+            self._grid.removeWidget(c)
+            c.deleteLater()
         self._cards.clear()
-    def populate(self, files):
-        self.clear(); self._calc()
-        for i, f in enumerate(files):
-            c = ThumbCard(f.name); c.set_px_path(str(f))
-            self._grid.addWidget(c, i//self._cols, i%self._cols, Qt.AlignmentFlag.AlignTop)
-            self._cards.append(c)
-    def card(self, i): return self._cards[i] if 0<=i<len(self._cards) else None
-    def update_card(self, i, result):
-        c = self.card(i)
-        if not c: return
-        c.set_status(result["status"], result.get("reason",""))
-        if result["status"]=="success" and result.get("thumbnail"):
-            c.set_px_pil(result["thumbnail"])
-        self.ensureWidgetVisible(c, 50, 50)
-    def _calc(self):
-        w = self.viewport().width()-8; cw = THUMB_PX+22
-        self._cols = max(2, min(w//cw, 10))
-    def resizeEvent(self, e):
-        super().resizeEvent(e); old = self._cols; self._calc()
+        self._total = 0
+        self._is_large = False
+
+        # Re-add header (ẩn)
+        self._grid.addWidget(self._header, 0, 0, 1, 20)
+
+    def populate(self, files: list[Path]):
+        """
+        Tạo grid từ danh sách file.
+        ≤500: tạo card + load source thumbnail
+        >500: chỉ hiện header, cards sẽ thêm lần lượt khi xử lý
+        """
+        self.clear()
+        self._total = len(files)
+        self._is_large = self._total > MAX_GRID_CARDS
+        self._calc_cols()
+
+        if self._is_large:
+            # Batch lớn: chỉ header, cards thêm khi có kết quả
+            self._header.setVisible(True)
+            self._header.setText(
+                f"📊 {self._total:,} ảnh — "
+                f"hiển thị {MAX_GRID_CARDS} kết quả gần nhất")
+        else:
+            # Batch nhỏ: tạo tất cả cards + load thumbnail gốc
+            self._header.setVisible(False)
+            for i, f in enumerate(files):
+                card = ThumbCard(f.name)
+                card.set_px_path(str(f))  # ← FIX: load source thumbnail
+                row = i // self._cols
+                col = i % self._cols
+                self._grid.addWidget(
+                    card, row, col, Qt.AlignmentFlag.AlignTop)
+                self._cards.append(card)
+
+    def update_card(self, global_idx: int, result: dict):
+        """Cập nhật card sau khi xử lý xong."""
+        if self._is_large:
+            # ── ROLLING WINDOW: thêm card mới ──
+            name = ""
+            inp = result.get("input_path")
+            if isinstance(inp, Path):
+                name = inp.name
+            else:
+                name = f"#{global_idx + 1}"
+
+            card = ThumbCard(name)
+            card.set_status(result["status"], result.get("reason", ""))
+
+            # Set thumbnail từ numpy array
+            thumb = result.get("thumbnail")
+            if result["status"] == "success" and thumb is not None:
+                if isinstance(thumb, np.ndarray):
+                    card.set_px_numpy(thumb)
+
+            # Thêm vào grid
+            idx = len(self._cards)
+            ro = self._row_offset()
+            self._grid.addWidget(
+                card, idx // self._cols + ro,
+                idx % self._cols, Qt.AlignmentFlag.AlignTop)
+            self._cards.append(card)
+
+            # Xoá cards cũ nếu vượt giới hạn
+            if len(self._cards) > MAX_GRID_CARDS:
+                excess = len(self._cards) - MAX_GRID_CARDS
+                for _ in range(excess):
+                    old = self._cards.pop(0)
+                    self._grid.removeWidget(old)
+                    old.deleteLater()
+                self._relayout()
+
+            # Update header
+            self._header.setText(
+                f"📊 Đã xử lý {global_idx + 1:,}/{self._total:,} — "
+                f"hiển thị {len(self._cards)} kết quả gần nhất")
+
+        else:
+            # ── BATCH NHỎ: update tại chỗ ──
+            if 0 <= global_idx < len(self._cards):
+                card = self._cards[global_idx]
+                card.set_status(result["status"], result.get("reason", ""))
+
+                # Set thumbnail từ numpy array (kết quả crop)
+                thumb = result.get("thumbnail")
+                if result["status"] == "success" and thumb is not None:
+                    if isinstance(thumb, np.ndarray):
+                        card.set_px_numpy(thumb)
+
+        # Auto-scroll tới card mới nhất/đang xử lý
+        target_card = self._cards[-1] if self._is_large else (
+            self._cards[global_idx] if 0 <= global_idx < len(self._cards)
+            else None)
+        if target_card:
+            self.ensureWidgetVisible(target_card, 50, 50)
+
+    def mark_processing(self, global_idx: int):
+        """Đánh dấu card đang xử lý."""
+        if not self._is_large and 0 <= global_idx < len(self._cards):
+            self._cards[global_idx].set_status("processing")
+
+    def _relayout(self):
+        """Sắp xếp lại grid sau khi xoá cards."""
+        ro = self._row_offset()
+        for i, card in enumerate(self._cards):
+            self._grid.removeWidget(card)
+            self._grid.addWidget(
+                card, i // self._cols + ro,
+                i % self._cols, Qt.AlignmentFlag.AlignTop)
+
+    def _calc_cols(self):
+        w = self.viewport().width() - 8
+        cw = THUMB_PX + 20
+        self._cols = max(2, min(w // cw, 12))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        old = self._cols
+        self._calc_cols()
         if old != self._cols and self._cards:
-            for i, c in enumerate(self._cards):
-                self._grid.removeWidget(c)
-                self._grid.addWidget(c, i//self._cols, i%self._cols, Qt.AlignmentFlag.AlignTop)
+            self._relayout()
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║  SECTION 9 — DASHBOARD                                      ║
+# ║  SECTION 10 — DASHBOARD                                     ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 class Dashboard(QWidget):
-    def __init__(self, sp: SysProfile, parent=None):
-        super().__init__(parent)
-        self.sp = sp
-        self.setMinimumWidth(340); self.setMaximumWidth(395)
-
+    def __init__(self, sys_info: SysInfo):
+        super().__init__()
+        self.sys = sys_info
+        self.setMinimumWidth(335); self.setMaximumWidth(390)
         root = QVBoxLayout(self)
-        root.setContentsMargins(0,0,0,0); root.setSpacing(4)
-
-        ttl = QLabel(f"⚙️  Bảng điều khiển")
+        root.setContentsMargins(0, 0, 0, 0); root.setSpacing(4)
+        ttl = QLabel("⚙️ Bảng điều khiển")
         ttl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        ttl.setStyleSheet(f"font-size:15px;font-weight:700;color:{C['acc']};padding:3px 0;")
+        ttl.setStyleSheet(
+            f"font-size:15px;font-weight:700;color:{C['acc']};padding:2px 0;")
         root.addWidget(ttl)
-
         self.tabs = QTabWidget()
         root.addWidget(self.tabs, 1)
-        self._build_tab1()
-        self._build_tab2()
-        self._build_tab3()
+        self._build_tab_settings()
+        self._build_tab_output()
+        self._apply_settings(CropSettings.load())
 
-    # ───────── Tab 1: Hệ thống ─────────
-    def _build_tab1(self):
-        w = QWidget(); lay = QVBoxLayout(w)
-        lay.setContentsMargins(6,6,6,6); lay.setSpacing(6)
-
-        g1 = QGroupBox("💻 Phần cứng")
-        g1l = QVBoxLayout(g1)
-        info = QLabel(self.sp.text()); info.setWordWrap(True)
-        info.setStyleSheet(
-            f"color:{C['t2']};font-family:'Cascadia Code','Consolas',monospace;"
-            f"font-size:10.5px;padding:3px;line-height:1.4;")
-        g1l.addWidget(info)
-        lay.addWidget(g1)
-
-        g2 = QGroupBox("⚡ Hiệu năng")
-        g2l = QVBoxLayout(g2); g2l.setSpacing(4)
-        self.sl_cpu = SliderRow("Giới hạn CPU:", 5, 80, self.sp.cpu_target,
-                                step=5, suffix="%", tip="CPU tối đa khi xử lý")
-        g2l.addWidget(self.sl_cpu)
-        self.sp_workers = SpinRow("Số luồng:", 1, self.sp.cores_p,
-                                  self.sp.rec_workers, tip="Luồng xử lý")
-        g2l.addWidget(self.sp_workers)
-        self.lbl_rt = QLabel("CPU: --% │ RAM: --%")
-        self.lbl_rt.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_rt.setStyleSheet(
-            f"color:{C['t2']};font-family:'Cascadia Code',monospace;font-size:11px;"
-            f"padding:5px;background:{C['bg_in']};border:1px solid {C['brd']};border-radius:5px;")
-        g2l.addWidget(self.lbl_rt)
-        lay.addWidget(g2)
-        lay.addStretch(1)
-        self.tabs.addTab(w, "💻 Hệ thống")
-
-    # ───────── Tab 2: Xử lý ─────────
-    def _build_tab2(self):
+    def _build_tab_settings(self):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         inner = QWidget()
         lay = QVBoxLayout(inner)
-        lay.setContentsMargins(6,6,6,6); lay.setSpacing(6)
+        lay.setContentsMargins(6, 6, 6, 6); lay.setSpacing(6)
 
-        # ── Model ──
         g1 = QGroupBox("🤖 Mô hình AI")
         g1l = QVBoxLayout(g1); g1l.setSpacing(4)
         mrow = QWidget(); mr = QHBoxLayout(mrow)
-        mr.setContentsMargins(0,0,0,0); mr.setSpacing(5)
-        mr.addWidget(self._lbl("Mô hình:", 130))
+        mr.setContentsMargins(0, 0, 0, 0); mr.setSpacing(4)
+        mr.addWidget(self._lbl("Mô hình:"))
         self.cb_model = QComboBox()
-        self.cb_model.addItems(["u2net","u2net_human_seg","isnet-general-use"])
-        self.cb_model.setToolTip(
-            "u2net — Tốt nhất tổng hợp (khuyên dùng)\n"
-            "u2net_human_seg — Tối ưu người\n"
-            "isnet-general-use — Nhanh, nhẹ")
+        self.cb_model.addItems(["u2net", "u2net_human_seg", "isnet-general-use"])
+        self.cb_model.setToolTip("u2net: Tốt nhất │ human_seg: Người │ isnet: Nhanh")
         mr.addWidget(self.cb_model, 1)
         g1l.addWidget(mrow)
-        self.sp_mask = SpinRow("Ngưỡng mask:", 30, 250, 120,
-                               tip="Thấp hơn = bắt nhiều chi tiết hơn (30-250)")
+        self.sp_mask = SpinRow("Ngưỡng mask:", 25, 250, 120,
+                               tip="Thấp=nhiều chi tiết, Cao=chặt hơn")
         g1l.addWidget(self.sp_mask)
         lay.addWidget(g1)
 
-        # ── Padding ──
-        g2 = QGroupBox("📐 Khoảng đệm (Padding)")
+        g2 = QGroupBox("📐 Khoảng đệm (px)")
         g2l = QVBoxLayout(g2); g2l.setSpacing(4)
-
-        note_pad = QLabel(
-            "💡 Padding tính bằng pixel — giữ chủ thể sát nền nhất.\n"
-            "Cạnh nào chủ thể đã sát biên ảnh sẽ tự bỏ padding.")
-        note_pad.setWordWrap(True)
-        note_pad.setStyleSheet(f"color:{C['t2']};font-size:10.5px;padding:2px;")
-        g2l.addWidget(note_pad)
-        g2l.addWidget(Sep())
+        note = QLabel(
+            "💡 Cạnh nào chủ thể sát biên (hoặc cách ≤ vài px)\n"
+            "sẽ tự bỏ padding → giữ bố cục gốc.")
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color:{C['t2']};font-size:10px;padding:1px;")
+        g2l.addWidget(note); g2l.addWidget(Sep())
 
         self.chk_uniform = QCheckBox("  Đệm đều 4 cạnh")
         self.chk_uniform.setChecked(True)
         self.chk_uniform.toggled.connect(self._toggle_pad)
         g2l.addWidget(self.chk_uniform)
 
-        self.sp_pad_all = SpinRow("Tất cả cạnh:", 0, 100, 10, suffix="px")
+        self.sp_pad_all = SpinRow("Tất cả:", 0, 200, 10, suffix="px")
         g2l.addWidget(self.sp_pad_all)
-
-        self.sp_pad_t = SpinRow("Trên:", 0, 100, 10, suffix="px")
-        self.sp_pad_b = SpinRow("Dưới:", 0, 100, 10, suffix="px")
-        self.sp_pad_l = SpinRow("Trái:", 0, 100, 10, suffix="px")
-        self.sp_pad_r = SpinRow("Phải:", 0, 100, 10, suffix="px")
+        self.sp_pad_t = SpinRow("Trên:", 0, 200, 10, suffix="px")
+        self.sp_pad_b = SpinRow("Dưới:", 0, 200, 10, suffix="px")
+        self.sp_pad_l = SpinRow("Trái:", 0, 200, 10, suffix="px")
+        self.sp_pad_r = SpinRow("Phải:", 0, 200, 10, suffix="px")
         for s in [self.sp_pad_t, self.sp_pad_b, self.sp_pad_l, self.sp_pad_r]:
             g2l.addWidget(s); s.setVisible(False)
 
         g2l.addWidget(Sep())
-        self.sl_edge = SliderRow(
-            "Ngưỡng sát biên:", 0, 10, 3, step=1, suffix="%",
-            tip="Cạnh subject cách biên ảnh ≤ X% → coi là sát biên")
+        self.sl_edge = SliderRow("Vùng biên (band):", 0, 10, 2.5,
+                                 step=0.5, suffix="%", decimals=1,
+                                 tip="Mask trong band X% biên → sát")
         g2l.addWidget(self.sl_edge)
+        self.sp_edge_gap = SpinRow("Dung sai sát biên:", 0, 30, 5, suffix="px",
+                                   tip="Bbox cách biên ≤ Npx → sát biên")
+        g2l.addWidget(self.sp_edge_gap)
         lay.addWidget(g2)
 
-        # ── Fill ──
-        g3 = QGroupBox("🎯 Vị trí chủ thể")
+        g3 = QGroupBox("🎯 Chủ thể trên canvas")
         g3l = QVBoxLayout(g3); g3l.setSpacing(4)
-        self.sl_fill = SliderRow("Chiếm canvas:", 50, 99, 92, suffix="%",
-                                 tip="% diện tích chủ thể chiếm canvas đầu ra")
+        self.sl_fill = SliderRow("Chiếm:", 50, 99, 92, suffix="%",
+                                 tip="% chủ thể trên canvas")
         g3l.addWidget(self.sl_fill)
-        self.sl_maxup = SliderRow("Phóng to tối đa:", 1, 4, 2,
+        self.sl_maxup = SliderRow("Phóng to max:", 1, 4, 2,
                                   step=0.5, suffix="x", decimals=1,
-                                  tip="Giới hạn upscale (tránh mờ)")
+                                  tip="Giới hạn upscale")
         g3l.addWidget(self.sl_maxup)
         lay.addWidget(g3)
+
+        g4 = QGroupBox("⚡ Hiệu năng")
+        g4l = QVBoxLayout(g4); g4l.setSpacing(4)
+        self.sl_cpu = SliderRow("Giới hạn CPU:", 5, 80, 20, step=5, suffix="%")
+        g4l.addWidget(self.sl_cpu)
+        lay.addWidget(g4)
+
         lay.addStretch(1)
         scroll.setWidget(inner)
-        self.tabs.addTab(scroll, "🖼️ Xử lý")
+        self.tabs.addTab(scroll, "🖼️ Cài đặt")
 
-    # ───────── Tab 3: Đầu ra ─────────
-    def _build_tab3(self):
+    def _build_tab_output(self):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         inner = QWidget()
         lay = QVBoxLayout(inner)
-        lay.setContentsMargins(6,6,6,6); lay.setSpacing(6)
+        lay.setContentsMargins(6, 6, 6, 6); lay.setSpacing(6)
 
-        # ── Frame ──
-        g1 = QGroupBox("🖼️ Tỷ lệ khung (Frame)")
+        g1 = QGroupBox("🖼️ Tỷ lệ & Kích thước")
         g1l = QVBoxLayout(g1); g1l.setSpacing(5)
-
         frow = QWidget(); fr = QHBoxLayout(frow)
-        fr.setContentsMargins(0,0,0,0); fr.setSpacing(5)
-        fr.addWidget(self._lbl("Frame:", 130))
+        fr.setContentsMargins(0, 0, 0, 0); fr.setSpacing(4)
+        fr.addWidget(self._lbl("Frame:"))
         self.cb_frame = QComboBox()
         for label, _, _ in FRAME_OPTIONS:
             self.cb_frame.addItem(label)
         self.cb_frame.currentIndexChanged.connect(self._on_frame)
         fr.addWidget(self.cb_frame, 1)
-        g1l.addWidget(frow)
-        g1l.addWidget(Sep())
+        g1l.addWidget(frow); g1l.addWidget(Sep())
 
-        # Output size mode
-        self.rad_auto = QRadioButton("  Tự động (giữ kích thước ảnh gốc)")
-        self.rad_custom = QRadioButton("  Tuỳ chỉnh kích thước:")
+        self.rad_auto = QRadioButton("  Tự động (= kích thước ảnh gốc)")
+        self.rad_custom = QRadioButton("  Nhập thủ công:")
         self.rad_auto.setChecked(True)
         self.rad_auto.toggled.connect(self._on_size_mode)
+        bg = QButtonGroup(self)
+        bg.addButton(self.rad_auto); bg.addButton(self.rad_custom)
+        g1l.addWidget(self.rad_auto); g1l.addWidget(self.rad_custom)
 
-        self.size_group = QButtonGroup(self)
-        self.size_group.addButton(self.rad_auto)
-        self.size_group.addButton(self.rad_custom)
-
-        g1l.addWidget(self.rad_auto)
-        g1l.addWidget(self.rad_custom)
-
-        # W × H row
-        self.sz_widget = QWidget()
-        sz = QHBoxLayout(self.sz_widget)
-        sz.setContentsMargins(20, 2, 0, 2); sz.setSpacing(5)
-        sz.addWidget(self._lbl("W:", 20))
-        self.sp_w = QSpinBox()
-        self.sp_w.setRange(256, 4096); self.sp_w.setValue(1024)
-        self.sp_w.setSuffix(" px")
-        sz.addWidget(self.sp_w, 1)
-        xl = QLabel("×"); xl.setFixedWidth(14)
-        xl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        sz.addWidget(xl)
-        sz.addWidget(self._lbl("H:", 20))
-        self.sp_h = QSpinBox()
-        self.sp_h.setRange(256, 4096); self.sp_h.setValue(1024)
-        self.sp_h.setSuffix(" px")
-        sz.addWidget(self.sp_h, 1)
-        g1l.addWidget(self.sz_widget)
-        self.sz_widget.setEnabled(False)  # default auto
-
-        hint = QLabel(
-            "ℹ️  Tự động: đầu ra = kích thước ảnh gốc.\n"
-            "Khi chọn frame preset (1:1, 4:3...): tỷ lệ\n"
-            "sẽ được tính dựa trên ảnh gốc, giữ đúng ratio.")
-        hint.setWordWrap(True)
-        hint.setStyleSheet(f"color:{C['t2']};font-size:10px;padding:2px;")
-        g1l.addWidget(hint)
+        self.sz_w = QWidget()
+        sz = QHBoxLayout(self.sz_w)
+        sz.setContentsMargins(18, 1, 0, 1); sz.setSpacing(4)
+        sz.addWidget(self._lbl("W:", 22))
+        self.sp_w = QSpinBox(); self.sp_w.setRange(256, 4096); self.sp_w.setValue(1024)
+        self.sp_w.setSuffix(" px"); sz.addWidget(self.sp_w, 1)
+        xl = QLabel("×"); xl.setFixedWidth(12)
+        xl.setAlignment(Qt.AlignmentFlag.AlignCenter); sz.addWidget(xl)
+        sz.addWidget(self._lbl("H:", 22))
+        self.sp_h = QSpinBox(); self.sp_h.setRange(256, 4096); self.sp_h.setValue(1024)
+        self.sp_h.setSuffix(" px"); sz.addWidget(self.sp_h, 1)
+        g1l.addWidget(self.sz_w); self.sz_w.setEnabled(False)
         lay.addWidget(g1)
 
-        # ── Quality ──
-        g2 = QGroupBox("📦 Chất lượng")
-        g2l = QVBoxLayout(g2); g2l.setSpacing(5)
-        self.sp_png = SpinRow("Nén PNG:", 0, 9, 9,
-                              tip="0 = nhanh, 9 = nhỏ nhất (tất cả lossless)")
+        g2 = QGroupBox("📦 Chất lượng PNG")
+        g2l = QVBoxLayout(g2); g2l.setSpacing(4)
+        self.sp_png = SpinRow("Nén:", 0, 9, 9, tip="0=nhanh, 9=nhỏ nhất (lossless)")
         g2l.addWidget(self.sp_png)
         self.chk_white = QCheckBox("  Nền trắng đầu ra")
-        self.chk_white.setChecked(True)
-        g2l.addWidget(self.chk_white)
+        self.chk_white.setChecked(True); g2l.addWidget(self.chk_white)
         lay.addWidget(g2)
 
-        # ── Filter ──
-        g3 = QGroupBox("🗑️ Lọc & Phân loại")
-        g3l = QVBoxLayout(g3); g3l.setSpacing(5)
-
-        self.sp_min = SpinRow("Ngưỡng loại bỏ:", 0, 2048, 512, suffix="px",
-                              tip="Loại ảnh khi CẢ HAI cạnh < giá trị này")
-        g3l.addWidget(self.sp_min)
-
-        note = QLabel(
-            "📌 Chỉ loại khi CẢ HAI cạnh < ngưỡng.\n"
-            "     (1 cạnh > ngưỡng → vẫn giữ)\n"
-            "     File gốc được di chuyển, không xoá.")
-        note.setWordWrap(True)
-        note.setStyleSheet(f"color:{C['warn']};font-size:10px;padding:2px;")
-        g3l.addWidget(note)
-
-        g3l.addWidget(Sep())
-
-        # Folder names
-        self.sp_out_name = self._text_row("Thư mục kết quả:", "Done")
-        g3l.addWidget(self.sp_out_name)
-        self.sp_rej_name = self._text_row("Thư mục loại bỏ:", "Loại bỏ")
-        g3l.addWidget(self.sp_rej_name)
-
+        g3 = QGroupBox("🗑️ Lọc & Thư mục")
+        g3l = QVBoxLayout(g3); g3l.setSpacing(4)
+        self.sp_min = SpinRow("Loại nếu max cạnh <", 0, 2048, 512, suffix="px",
+                              tip="max(w,h)<N → di chuyển")
+        g3l.addWidget(self.sp_min); g3l.addWidget(Sep())
+        self.txt_out = TextRow("Thư mục kết quả:", "Done")
+        g3l.addWidget(self.txt_out)
+        self.txt_rej = TextRow("Thư mục loại bỏ:", "Loại bỏ")
+        g3l.addWidget(self.txt_rej)
         lay.addWidget(g3)
+
         lay.addStretch(1)
         scroll.setWidget(inner)
         self.tabs.addTab(scroll, "📤 Đầu ra")
 
-    # ─── Helpers ───
     @staticmethod
-    def _lbl(text, w=130):
-        l = QLabel(text); l.setFixedWidth(w); return l
-
-    def _text_row(self, label, default):
-        w = QWidget(); lay = QHBoxLayout(w)
-        lay.setContentsMargins(0,1,0,1); lay.setSpacing(5)
-        lay.addWidget(self._lbl(label, 130))
-        from PyQt6.QtWidgets import QLineEdit
-        le = QLineEdit(default)
-        le.setStyleSheet(
-            f"background:{C['bg_in']};color:{C['t1']};border:1px solid {C['brd']};"
-            f"border-radius:5px;padding:5px 8px;font-size:12px;")
-        lay.addWidget(le, 1)
-        w._le = le
-        return w
+    def _lbl(t, w=125):
+        l = QLabel(t); l.setFixedWidth(w); return l
 
     def _toggle_pad(self, uniform):
         self.sp_pad_all.setVisible(uniform)
@@ -1218,92 +1289,85 @@ class Dashboard(QWidget):
         if rw > 0 and rh > 0:
             base = max(self.sp_w.value(), self.sp_h.value())
             sc = base / max(rw, rh)
-            self.sp_w.setValue(int(rw * sc))
-            self.sp_h.setValue(int(rh * sc))
+            self.sp_w.setValue(int(rw * sc)); self.sp_h.setValue(int(rh * sc))
 
-    def _on_size_mode(self, auto_checked):
-        self.sz_widget.setEnabled(not auto_checked)
+    def _on_size_mode(self, auto):
+        self.sz_w.setEnabled(not auto)
 
     def get_settings(self) -> CropSettings:
-        uniform = self.chk_uniform.isChecked()
         auto = self.rad_auto.isChecked()
-        return CropSettings(
+        s = CropSettings(
             model_name=self.cb_model.currentText(),
             padding_px=self.sp_pad_all.value(),
             padding_top_px=self.sp_pad_t.value(),
             padding_bottom_px=self.sp_pad_b.value(),
             padding_left_px=self.sp_pad_l.value(),
             padding_right_px=self.sp_pad_r.value(),
-            use_uniform_padding=uniform,
+            use_uniform_padding=self.chk_uniform.isChecked(),
             edge_threshold_pct=self.sl_edge.value(),
+            edge_gap_px=self.sp_edge_gap.value(),
             frame_index=self.cb_frame.currentIndex(),
             target_width=self.sp_w.value() if not auto else 0,
             target_height=self.sp_h.value() if not auto else 0,
+            auto_output_size=auto,
             png_compress=self.sp_png.value(),
             min_size_px=self.sp_min.value(),
             subject_fill=self.sl_fill.value(),
             mask_threshold=self.sp_mask.value(),
             white_bg=self.chk_white.isChecked(),
             max_upscale=self.sl_maxup.value(),
-            auto_output_size=auto,
-            output_folder=self.sp_out_name._le.text().strip() or "Done",
-            rejected_folder=self.sp_rej_name._le.text().strip() or "Loại bỏ",
-        )
+            output_folder=self.txt_out.value() or "Done",
+            rejected_folder=self.txt_rej.value() or "Loại bỏ",
+            cpu_limit=self.sl_cpu.value())
+        s.save()
+        return s
 
-    def cpu_limit(self): return self.sl_cpu.value()
-
-    def update_sysload(self, cpu, ram):
-        col = C["ok"] if cpu<=40 else (C["warn"] if cpu<=70 else C["err"])
-        self.lbl_rt.setText(f"CPU: {cpu:.0f}%  │  RAM: {ram:.0f}%")
-        self.lbl_rt.setStyleSheet(
-            f"color:{col};font-family:'Cascadia Code',monospace;font-size:11px;"
-            f"padding:5px;background:{C['bg_in']};border:1px solid {C['brd']};border-radius:5px;")
+    def _apply_settings(self, s: CropSettings):
+        models = ["u2net", "u2net_human_seg", "isnet-general-use"]
+        self.cb_model.setCurrentIndex(
+            models.index(s.model_name) if s.model_name in models else 0)
+        self.sp_mask.setValue(s.mask_threshold)
+        self.chk_uniform.setChecked(s.use_uniform_padding)
+        self.sp_pad_all.setValue(s.padding_px)
+        self.sp_pad_t.setValue(s.padding_top_px)
+        self.sp_pad_b.setValue(s.padding_bottom_px)
+        self.sp_pad_l.setValue(s.padding_left_px)
+        self.sp_pad_r.setValue(s.padding_right_px)
+        self.sl_edge.setValue(s.edge_threshold_pct)
+        self.sp_edge_gap.setValue(s.edge_gap_px)
+        self.sl_fill.setValue(s.subject_fill)
+        self.sl_maxup.setValue(s.max_upscale)
+        self.sl_cpu.setValue(s.cpu_limit)
+        fi = s.frame_index if 0 <= s.frame_index < len(FRAME_OPTIONS) else 0
+        self.cb_frame.setCurrentIndex(fi)
+        if s.auto_output_size:
+            self.rad_auto.setChecked(True)
+        else:
+            self.rad_custom.setChecked(True)
+        self.sp_w.setValue(s.target_width if s.target_width > 0 else 1024)
+        self.sp_h.setValue(s.target_height if s.target_height > 0 else 1024)
+        self.sp_png.setValue(s.png_compress)
+        self.sp_min.setValue(s.min_size_px)
+        self.chk_white.setChecked(s.white_bg)
+        self.txt_out.setValue(s.output_folder)
+        self.txt_rej.setValue(s.rejected_folder)
 
     def reset_defaults(self):
-        self.cb_model.setCurrentIndex(0)
-        self.sp_mask.setValue(120)
-        self.chk_uniform.setChecked(True)
-        self.sp_pad_all.setValue(10)
-        for s in [self.sp_pad_t,self.sp_pad_b,self.sp_pad_l,self.sp_pad_r]: s.setValue(10)
-        self.sl_edge.setValue(3)
-        self.sl_fill.setValue(92); self.sl_maxup.setValue(2)
-        self.cb_frame.setCurrentIndex(0)
-        self.rad_auto.setChecked(True)
-        self.sp_w.setValue(1024); self.sp_h.setValue(1024)
-        self.sp_png.setValue(9); self.sp_min.setValue(512)
-        self.chk_white.setChecked(True)
-        self.sl_cpu.setValue(20); self.sp_workers.setValue(self.sp.rec_workers)
-        self.sp_out_name._le.setText("Done")
-        self.sp_rej_name._le.setText("Loại bỏ")
+        d = CropSettings.defaults()
+        self._apply_settings(d)
+        d.save()
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║  SECTION 10 — MAIN WINDOW                                   ║
+# ║  SECTION 11 — MAIN WINDOW                                   ║
 # ╚══════════════════════════════════════════════════════════════╝
-#
-# ┌─────────────────┬────────────────────────────────────────────┐
-# │                 │  ┌── 📂 DROP ZONE ──────────────────────┐ │
-# │   DASHBOARD     │  └─────────────────────────────────────────┘ │
-# │  ┌───────────┐  │  [▶ Bắt đầu] [⏸] [🛑] [🔄 Reset]  N ảnh │
-# │  │💻 Hệ thống│  │  ████████████░░░  45%   12/27            │
-# │  │🖼 Xử lý  │  │  ┌──┐ ┌──┐ ┌──┐ ┌──┐ ┌──┐ ┌──┐ ┌──┐   │
-# │  │📤 Đầu ra  │  │  │🖼│ │🖼│ │🖼│ │🖼│ │🖼│ │🖼│ │🖼│   │
-# │  └───────────┘  │  └──┘ └──┘ └──┘ └──┘ └──┘ └──┘ └──┘   │
-# │                 │  ┌──┐ ┌──┐ ┌──┐ ┌──┐ ┌──┐ ┌──┐        │
-# │                 │  │🖼│ │🖼│ │🖼│ │🖼│ │🖼│ │🖼│        │
-# │                 │  └──┘ └──┘ └──┘ └──┘ └──┘ └──┘        │
-# │                 ├────────────────────────────────────────────┤
-# │                 │  📋 Log  (thu nhỏ — kéo lên để xem thêm)│
-# └─────────────────┴────────────────────────────────────────────┘
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"🔲 {APP_TITLE} — Cắt chủ thể thông minh")
-        self.setMinimumSize(1060, 660)
-        self.resize(1340, 780)
-
-        self.sp = detect_system(20.0)
+        self.setWindowTitle(f"🔲 {APP_TITLE}")
+        self.setMinimumSize(1060, 640); self.resize(1320, 760)
+        self.sys = detect_system()
         self.worker = BatchWorker()
         self.worker.sig_progress.connect(self._on_progress)
         self.worker.sig_file_start.connect(self._on_file_start)
@@ -1313,57 +1377,52 @@ class MainWindow(QMainWindow):
         self._busy = False
         self.setStyleSheet(build_qss())
         self._build()
+        self._setup_statusbar()
+        self._start_monitor()
 
     def _build(self):
         root = QWidget(); self.setCentralWidget(root)
         main = QHBoxLayout(root)
-        main.setContentsMargins(8,8,8,8); main.setSpacing(8)
+        main.setContentsMargins(8, 8, 8, 4); main.setSpacing(8)
 
-        # ── LEFT ──
-        self.dash = Dashboard(self.sp)
+        self.dash = Dashboard(self.sys)
         main.addWidget(self.dash)
 
-        # ── RIGHT ──
         right = QWidget()
         rl = QVBoxLayout(right)
-        rl.setContentsMargins(0,0,0,0); rl.setSpacing(6)
+        rl.setContentsMargins(0, 0, 0, 0); rl.setSpacing(5)
 
-        # Drop zone
         self.dz = DropZone()
         self.dz.folder_dropped.connect(self._on_folder)
         rl.addWidget(self.dz)
 
-        # Action bar
-        ab = QWidget()
-        al = QHBoxLayout(ab)
-        al.setContentsMargins(0,0,0,0); al.setSpacing(6)
+        ab = QWidget(); al = QHBoxLayout(ab)
+        al.setContentsMargins(0, 0, 0, 0); al.setSpacing(5)
 
         self.btn_start = QPushButton("▶  Bắt đầu")
-        self.btn_start.setProperty("class","primary")
-        self.btn_start.setMinimumHeight(34); self.btn_start.setMinimumWidth(120)
+        self.btn_start.setProperty("class", "primary")
+        self.btn_start.setMinimumHeight(32)
         self.btn_start.clicked.connect(self._on_start)
         self.btn_start.setEnabled(False)
 
         self.btn_pause = QPushButton("⏸  Dừng")
-        self.btn_pause.setMinimumHeight(34)
+        self.btn_pause.setMinimumHeight(32)
         self.btn_pause.clicked.connect(self._on_pause)
         self.btn_pause.setEnabled(False)
 
         self.btn_cancel = QPushButton("🛑  Huỷ")
-        self.btn_cancel.setProperty("class","danger")
-        self.btn_cancel.setMinimumHeight(34)
+        self.btn_cancel.setProperty("class", "danger")
+        self.btn_cancel.setMinimumHeight(32)
         self.btn_cancel.clicked.connect(self._on_cancel)
         self.btn_cancel.setEnabled(False)
 
         self.btn_reset = QPushButton("🔄  Làm mới")
-        self.btn_reset.setProperty("class","warn")
-        self.btn_reset.setMinimumHeight(34)
+        self.btn_reset.setProperty("class", "warn")
+        self.btn_reset.setMinimumHeight(32)
         self.btn_reset.clicked.connect(self._on_reset)
 
-        al.addWidget(self.btn_start)
-        al.addWidget(self.btn_pause)
-        al.addWidget(self.btn_cancel)
-        al.addWidget(self.btn_reset)
+        al.addWidget(self.btn_start); al.addWidget(self.btn_pause)
+        al.addWidget(self.btn_cancel); al.addWidget(self.btn_reset)
         al.addStretch(1)
 
         self.lbl_count = QLabel("📁 Chưa chọn thư mục")
@@ -1371,13 +1430,11 @@ class MainWindow(QMainWindow):
         al.addWidget(self.lbl_count)
         rl.addWidget(ab)
 
-        # Progress
         self.progress = QProgressBar()
         self.progress.setValue(0)
-        self.progress.setFormat("%v / %m ảnh  —  %p%")
+        self.progress.setFormat("%v / %m ảnh — %p%")
         rl.addWidget(self.progress)
 
-        # Splitter: thumbnails (lớn) + log (nhỏ)
         split = QSplitter(Qt.Orientation.Vertical)
         split.setHandleWidth(4)
 
@@ -1386,45 +1443,79 @@ class MainWindow(QMainWindow):
 
         log_w = QWidget()
         ll = QVBoxLayout(log_w)
-        ll.setContentsMargins(0,0,0,0); ll.setSpacing(2)
+        ll.setContentsMargins(0, 0, 0, 0); ll.setSpacing(2)
         lh = QLabel("📋 Nhật ký")
-        lh.setStyleSheet(f"color:{C['acc']};font-weight:700;font-size:12px;")
+        lh.setStyleSheet(f"color:{C['acc']};font-weight:700;font-size:11px;")
         ll.addWidget(lh)
-        self.log = QTextEdit()
-        self.log.setReadOnly(True)
-        self.log.setPlaceholderText("Nhật ký hiển thị khi bắt đầu xử lý...")
+        self.log = QTextEdit(); self.log.setReadOnly(True)
+        self.log.setPlaceholderText("Nhật ký hiển thị khi bắt đầu...")
+        self.log.document().setMaximumBlockCount(5000)
         ll.addWidget(self.log)
         split.addWidget(log_w)
 
-        # Thumbnail chiếm 80%, log 20%
-        split.setStretchFactor(0, 5)
-        split.setStretchFactor(1, 1)
-        # Set initial sizes (thumbnails lớn, log nhỏ)
-        split.setSizes([500, 100])
-
+        split.setStretchFactor(0, 6); split.setStretchFactor(1, 1)
+        split.setSizes([550, 80])
         rl.addWidget(split, 1)
         main.addWidget(right, 1)
 
-    # ═══════════════ SLOTS ═══════════════
+    def _setup_statusbar(self):
+        sb = QStatusBar(); self.setStatusBar(sb)
+        s = self.sys
+        hw = [f"⚙ {s.cpu_name[:35]}", f"🧵 {s.cores_p}C/{s.cores_l}T",
+              f"🧠 {s.ram_gb:.0f}GB"]
+        if s.has_cuda: hw.append(f"🎮 {s.gpu[:25]}")
+        self.lbl_hw = QLabel("  │  ".join(hw))
+        self.lbl_hw.setStyleSheet(
+            f"color:{C['t2']};font-size:10.5px;"
+            f"font-family:'Cascadia Code','Consolas',monospace;")
+        sb.addWidget(self.lbl_hw, 1)
+        self.lbl_cpu = QLabel("CPU: --%")
+        self.lbl_ram = QLabel("RAM: --%")
+        for l in [self.lbl_cpu, self.lbl_ram]:
+            l.setStyleSheet(
+                f"color:{C['t2']};font-size:11px;font-weight:600;"
+                f"font-family:'Cascadia Code',monospace;padding:0 4px;")
+        sb.addPermanentWidget(self.lbl_cpu)
+        sb.addPermanentWidget(self.lbl_ram)
+
+    def _start_monitor(self):
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick_sys)
+        self._timer.start(2000); self._tick_sys()
+
+    def _tick_sys(self):
+        self._show_load(psutil.cpu_percent(interval=0),
+                        psutil.virtual_memory().percent)
+
+    def _show_load(self, cpu, ram):
+        cc = C["ok"] if cpu <= 40 else (C["warn"] if cpu <= 70 else C["err"])
+        rc = C["ok"] if ram <= 60 else (C["warn"] if ram <= 80 else C["err"])
+        self.lbl_cpu.setText(f"CPU: {cpu:.0f}%")
+        self.lbl_cpu.setStyleSheet(
+            f"color:{cc};font-size:11px;font-weight:600;"
+            f"font-family:'Cascadia Code',monospace;padding:0 4px;")
+        self.lbl_ram.setText(f"RAM: {ram:.0f}%")
+        self.lbl_ram.setStyleSheet(
+            f"color:{rc};font-size:11px;font-weight:600;"
+            f"font-family:'Cascadia Code',monospace;padding:0 4px;")
 
     def _on_folder(self, path):
         self.worker.set_folder(path)
         n = len(self.worker.file_list)
-        self.lbl_count.setText(f"📁 {n} ảnh" if n else "⚠️ Không có ảnh")
+        self.lbl_count.setText(f"📁 {n:,} ảnh" if n else "⚠️ Không có ảnh")
         self.btn_start.setEnabled(n > 0)
         self.progress.setMaximum(max(n, 1)); self.progress.setValue(0)
         if n:
             self.thumbs.populate(self.worker.file_list)
             self._on_log(
-                f"📂 Thư mục: {path}\n📁 {n} ảnh hỗ trợ "
-                f"({', '.join(sorted(SUPPORTED_EXT))})")
+                f"📂 {path}\n📁 {n:,} ảnh"
+                + (f"\n💡 Batch lớn — tối ưu hiệu suất" if n > 500 else ""))
         else:
             self.thumbs.clear()
 
     def _on_start(self):
         if self._busy: return
         self.worker.settings = self.dash.get_settings()
-        self.worker.cpu_limit = self.dash.cpu_limit()
         self.progress.setValue(0); self.log.clear()
         self._set_busy(True); self.worker.start()
 
@@ -1433,66 +1524,59 @@ class MainWindow(QMainWindow):
         if "Dừng" in self.btn_pause.text():
             self.worker.pause()
             self.btn_pause.setText("▶  Tiếp tục")
-            self.btn_pause.setProperty("class","primary")
-            self._on_log("⏸️  Đã tạm dừng")
+            self.btn_pause.setProperty("class", "primary")
+            self._on_log("⏸️ Tạm dừng")
         else:
             self.worker.resume()
             self.btn_pause.setText("⏸  Dừng")
-            self.btn_pause.setProperty("class","")
-            self._on_log("▶️  Tiếp tục")
+            self.btn_pause.setProperty("class", "")
+            self._on_log("▶️ Tiếp tục")
         self.btn_pause.style().unpolish(self.btn_pause)
         self.btn_pause.style().polish(self.btn_pause)
 
     def _on_cancel(self):
         if not self._busy: return
-        r = QMessageBox.question(
-            self, "Xác nhận huỷ",
-            "Huỷ bỏ? Ảnh đã xong vẫn được giữ.",
-            QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No)
-        if r == QMessageBox.StandardButton.Yes:
+        if QMessageBox.question(
+            self, "Xác nhận", "Huỷ bỏ? Ảnh đã xong vẫn giữ.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        ) == QMessageBox.StandardButton.Yes:
             self.worker.cancel()
 
     def _on_reset(self):
         if self._busy:
-            r = QMessageBox.question(
-                self, "Đang xử lý",
-                "Đang chạy! Huỷ và làm mới toàn bộ?",
-                QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No)
-            if r != QMessageBox.StandardButton.Yes: return
+            if QMessageBox.question(
+                self, "Đang xử lý", "Huỷ và làm mới?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            ) != QMessageBox.StandardButton.Yes:
+                return
             self.worker.cancel(); self.worker.wait(3000)
-        self.worker.release_resources()
-        self.thumbs.clear(); self.log.clear()
+        self.worker.release(); self.thumbs.clear(); self.log.clear()
         self.progress.setValue(0); self.progress.setMaximum(1)
         self.dz.reset()
         self.lbl_count.setText("📁 Chưa chọn thư mục")
         self.btn_start.setEnabled(False)
-        self.dash.reset_defaults()
-        self._set_busy(False)
-        gc.collect()
-        self._on_log("🔄 Đã làm mới — Bộ nhớ đã giải phóng")
-        self.dash.update_sysload(
-            psutil.cpu_percent(interval=0.1),
-            psutil.virtual_memory().percent)
+        self.dash.reset_defaults(); self._set_busy(False); gc.collect()
+        self._on_log("🔄 Đã làm mới — Bộ nhớ giải phóng")
 
     def _on_progress(self, cur, total, result):
         self.progress.setValue(cur)
         self.thumbs.update_card(cur - 1, result)
 
     def _on_file_start(self, idx, name):
-        c = self.thumbs.card(idx)
-        if c: c.set_status("processing")
+        self.thumbs.mark_processing(idx)
 
-    def _on_finished(self, results):
+    def _on_finished(self, summary):
         self._set_busy(False)
-        s = self.dash.get_settings()
-        ok = sum(1 for r in results if r["status"]=="success")
-        rej = sum(1 for r in results if r["status"]=="rejected")
-        msg = f"✅ Đã xử lý xong!\n\nThành công: {ok} ảnh → '{s.output_folder}'\n"
-        if rej: msg += f"Loại bỏ: {rej} ảnh → '{s.rejected_folder}'\n"
-        msg += f"\nTổng: {len(results)} ảnh"
-        QMessageBox.information(self, "Hoàn tất", msg)
+        if summary:
+            cnt = summary[0]; s = self.dash.get_settings()
+            QMessageBox.information(self, "Hoàn tất",
+                f"✅ Xong!\n\n"
+                f"Thành công: {cnt.get('success',0):,} → '{s.output_folder}'\n"
+                f"Loại bỏ: {cnt.get('rejected',0):,} → '{s.rejected_folder}'\n"
+                f"Bỏ qua: {cnt.get('skipped',0):,}  Lỗi: {cnt.get('error',0):,}\n\n"
+                f"Tổng: {sum(cnt.values()):,}")
 
     def _on_log(self, msg):
         self.log.append(msg)
@@ -1501,7 +1585,7 @@ class MainWindow(QMainWindow):
         self.log.setTextCursor(c)
 
     def _on_sysload(self, cpu, ram):
-        self.dash.update_sysload(cpu, ram)
+        self._show_load(cpu, ram)
 
     def _set_busy(self, busy):
         self._busy = busy
@@ -1513,12 +1597,14 @@ class MainWindow(QMainWindow):
         if not busy: self.btn_pause.setText("⏸  Dừng")
 
     def closeEvent(self, e):
+        try: self.dash.get_settings()
+        except Exception: pass
         if self._busy: self.worker.cancel(); self.worker.wait(3000)
-        self.worker.release_resources(); gc.collect(); e.accept()
+        self.worker.release(); gc.collect(); e.accept()
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║  SECTION 11 — RUN                                           ║
+# ║  SECTION 12 — ENTRY                                         ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 def main():
