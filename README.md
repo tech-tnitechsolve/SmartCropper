@@ -1,4 +1,3 @@
-```markdown
 <div align="center">
 
 # 🔲 Smart Subject Cropper
@@ -301,4 +300,3 @@ Mọi đóng góp đều được chào đón!
 Made with ❤️
 
 </div>
-```
