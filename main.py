@@ -72,7 +72,7 @@ class CropSettings:
     max_upscale: float = 2.0
     # ────────────────────────────────────────────────
     png_compress: int = 9
-    min_size_px: int = 680
+    min_size_px: int = 700
     subject_fill: float = 92.0
     mask_threshold: int = 120
     output_folder: str = "Done"
