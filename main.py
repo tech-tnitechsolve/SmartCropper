@@ -1246,6 +1246,12 @@ class Dashboard(QWidget):
         root.addWidget(self.tabs, 1)
         self._build_tab_crop()
         self._build_tab_output()
+        # Thêm nút Reset mặc định
+        btn_reset_default = QPushButton("🔁 Reset mặc định")
+        btn_reset_default.setProperty("class", "warn")
+        btn_reset_default.setMinimumHeight(32)
+        btn_reset_default.clicked.connect(self.reset_defaults)
+        root.addWidget(btn_reset_default)
         self._apply_settings(CropSettings.load())
 
     # ── TAB 1: Crop ──────────────────────────────────────────
@@ -1702,7 +1708,7 @@ class MainWindow(QMainWindow):
         self.dz.reset()
         self.lbl_count.setText("📁 Chưa chọn thư mục")
         self.btn_start.setEnabled(False)
-        self.dash.reset_defaults()
+        # self.dash.reset_defaults()  # Đã bỏ, chỉ clear dữ liệu tạm thời
         self._set_busy(False); gc.collect()
         self._on_log("🔄 Làm mới — Bộ nhớ giải phóng")
 
