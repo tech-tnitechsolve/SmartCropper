@@ -40,7 +40,7 @@ from PyQt6.QtGui import (
 # ╚══════════════════════════════════════════════════════════════╝
 
 APP_TITLE = "Smart Subject Cropper v3.4"
-SUPPORTED_EXT = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif"}
+SUPPORTED_EXT = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif", ".jfif", ".raw", ".dng", ".heic", ".heif", ".avif", ".svg", ".jp2", ".exr", ".hdr" }
 THUMB_PX = 128
 SETTINGS_FILE = Path(__file__).parent / "cropper_settings.json"
 
@@ -1399,7 +1399,7 @@ class Dashboard(QWidget):
         g3 = QGroupBox("🗑️ Lọc & Thư mục")
         g3l = QVBoxLayout(g3); g3l.setSpacing(4)
         self.sp_min = SpinRow(
-            "Loại nếu subject<", 0, 2048, 600, suffix="px")
+            "Loại nếu subject<", 0, 8000, 700, suffix="px")
         g3l.addWidget(self.sp_min)
         min_note = QLabel(
             "💡 Subject có cạnh lớn nhất < ngưỡng\n"
