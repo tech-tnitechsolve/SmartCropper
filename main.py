@@ -105,7 +105,7 @@ class CropSettings:
     output_folder: str = "Done"
     rejected_folder: str = "Loại bỏ"
     cpu_limit: float = 20.0
-    scan_subfolders: bool = False
+    scan_subfolders: bool = True
     adaptive_speed: bool = True
     parallel_mode: str = "auto"
     max_workers: int = 1
@@ -1362,8 +1362,8 @@ class ThumbGrid(QScrollArea):
                 if (result["status"] == "success"
                         and isinstance(thumb, np.ndarray)):
                     c.set_px_numpy(thumb)
-        if self._cards:
-            self.ensureWidgetVisible(self._cards[-1], 50, 50)
+        # Preserve current scroll position during updates so the user
+        # can keep watching the current file without the grid jumping.
 
     def mark_processing(self, gi):
         if not self._is_large and 0 <= gi < len(self._cards):
@@ -1580,7 +1580,7 @@ class Dashboard(QWidget):
         g0l = QVBoxLayout(g0); g0l.setSpacing(4)
         self.chk_subfolder = QCheckBox(
             "  Quét cả thư mục con (subfolder)")
-        self.chk_subfolder.setChecked(False)
+        self.chk_subfolder.setChecked(True)
         self.chk_subfolder.setToolTip(
             "BẬT: Quét đệ quy tất cả subfolder\n"
             "Mỗi subfolder có Done/ và Loại bỏ/ riêng")
@@ -2021,10 +2021,13 @@ class MainWindow(QMainWindow):
                 f"Tổng: {sum(cnt.values()):,}")
 
     def _on_log(self, msg):
+        scrollbar = self.log.verticalScrollBar()
+        at_bottom = scrollbar.value() >= scrollbar.maximum() - 20
         self.log.append(msg)
-        c = self.log.textCursor()
-        c.movePosition(QTextCursor.MoveOperation.End)
-        self.log.setTextCursor(c)
+        if at_bottom:
+            c = self.log.textCursor()
+            c.movePosition(QTextCursor.MoveOperation.End)
+            self.log.setTextCursor(c)
 
     def _on_sysload(self, cpu, ram, speed):
         self._show_load(cpu, ram)
