@@ -16,6 +16,7 @@ from math import gcd
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import OrderedDict
+import concurrent.futures
 import cv2
 import numpy as np
 import psutil
@@ -42,11 +43,37 @@ from PyQt6.QtGui import (
 APP_TITLE = "Smart Subject Cropper v3.4"
 SUPPORTED_EXT = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif", ".jfif", ".raw", ".dng", ".heic", ".heif", ".avif", ".svg", ".jp2", ".exr", ".hdr" }
 THUMB_PX = 128
+PREVIEW_PX = 96
+MASK_MAX_DIM = 1024
 SETTINGS_FILE = Path(__file__).parent / "cropper_settings.json"
 
 MAX_GRID_CARDS = 500
 GC_EVERY_N = 25
 RAM_THROTTLE_PCT = 85
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║  THUMBNAIL LOADER THREAD                                    ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+class ThumbnailLoader(QThread):
+    loaded = pyqtSignal(int, object)  # index, numpy array
+
+    def __init__(self, files):
+        super().__init__()
+        self.files = files
+
+    def run(self):
+        for i, f in enumerate(self.files):
+            if self.isInterruptionRequested():
+                break
+            try:
+                with PILImage.open(str(f)) as img:
+                    img = img.convert("RGB")
+                    img.thumbnail((PREVIEW_PX, PREVIEW_PX), PILImage.LANCZOS)
+                    arr = np.array(img)
+                self.loaded.emit(i, arr)
+            except Exception:
+                pass  # Skip on error
 
 # ╔══════════════════════════════════════════════════════════════╗
 # ║  SECTION 2 — SETTINGS                                       ║
@@ -80,6 +107,8 @@ class CropSettings:
     cpu_limit: float = 20.0
     scan_subfolders: bool = False
     adaptive_speed: bool = True
+    parallel_mode: str = "auto"
+    max_workers: int = 1
 
     def save(self, path: Path = SETTINGS_FILE):
         try:
@@ -340,8 +369,7 @@ class FolderGroup:
 def scan_folder(root: str, recursive: bool = False) -> list[FolderGroup]:
     root_path = Path(root)
     groups: OrderedDict[str, FolderGroup] = OrderedDict()
-    all_files = sorted(
-        root_path.rglob("*") if recursive else root_path.iterdir())
+    all_files = root_path.rglob("*") if recursive else root_path.iterdir()
     for f in all_files:
         if not f.is_file() or f.suffix.lower() not in SUPPORTED_EXT:
             continue
@@ -360,6 +388,23 @@ def scan_folder(root: str, recursive: bool = False) -> list[FolderGroup]:
                 folder=parent, files=[], rel_path=rel_str)
         groups[key].files.append(f)
     return list(groups.values())
+
+
+class FolderScanner(QThread):
+    scanned = pyqtSignal(list, str)
+    error = pyqtSignal(str)
+
+    def __init__(self, path: str, recursive: bool = False):
+        super().__init__()
+        self.path = path
+        self.recursive = recursive
+
+    def run(self):
+        try:
+            groups = scan_folder(self.path, self.recursive)
+            self.scanned.emit(groups, self.path)
+        except Exception as e:
+            self.error.emit(str(e))
 
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -391,6 +436,17 @@ class SmartCropper:
 
     def release(self):
         self._session = None; gc.collect()
+
+    def _prepare_mask_image(self, img: PILImage.Image) -> tuple[PILImage.Image, float]:
+        w, h = img.size
+        max_dim = min(max(w, h), MASK_MAX_DIM)
+        if max(w, h) <= MASK_MAX_DIM:
+            return img.copy(), 1.0
+        scale = max_dim / max(w, h)
+        resized = img.resize(
+            (max(1, int(w * scale)), max(1, int(h * scale))),
+            PILImage.LANCZOS)
+        return resized, scale
 
     # ── Mask generation ──────────────────────────────────────
     def _get_mask(self, img: PILImage.Image) -> np.ndarray:
@@ -611,15 +667,21 @@ class SmartCropper:
                 return r
 
             # ══ AI: tạo mask + tìm subject ══
-            mask = self._get_mask(img)
+            mask_img, scale = self._prepare_mask_image(img)
+            mask = self._get_mask(mask_img)
             bbox = self._bbox(mask)
             if bbox is None:
-                img.close(); del img, mask
+                img.close(); del img, mask_img, mask
                 r.update(status="skipped",
                          reason="Không tìm thấy chủ thể")
                 return r
 
             x1, y1, x2, y2 = bbox
+            sw, sh = int((x2 - x1) / scale), int((y2 - y1) / scale)
+            x1 = min(max(int(round(x1 / scale)), 0), w - 1)
+            y1 = min(max(int(round(y1 / scale)), 0), h - 1)
+            x2 = min(max(int(round(x2 / scale)), x1 + 1), w)
+            y2 = min(max(int(round(y2 / scale)), y1 + 1), h)
             sw, sh = x2 - x1, y2 - y1
             r["subject_size"] = (sw, sh)
 
@@ -635,9 +697,12 @@ class SmartCropper:
                 return r
 
             # ══ Phát hiện cạnh sát biên ══
-            edges = self._detect_edges(mask, x1, y1, x2, y2, w, h)
+            edges = self._detect_edges(
+                mask, int(x1 * scale), int(y1 * scale),
+                int(x2 * scale), int(y2 * scale),
+                mask.shape[1], mask.shape[0])
             r["edges"] = edges
-            del mask
+            del mask, mask_img
 
             # ══ BƯỚC 1: Crop cơ bản (bbox + padding + edge) ══
             if s.use_uniform_padding:
@@ -693,7 +758,7 @@ class SmartCropper:
 
             # ── Thumbnail ──
             thumb = crop.copy()
-            thumb.thumbnail((THUMB_PX, THUMB_PX), PILImage.LANCZOS)
+            thumb.thumbnail((PREVIEW_PX, PREVIEW_PX), PILImage.LANCZOS)
             thumb_data = np.array(thumb.convert("RGB")).copy()
             del crop, thumb
 
@@ -767,6 +832,28 @@ class BatchWorker(QThread):
             self._cond.wait(self._mx)
         self._mx.unlock()
 
+    def _calc_parallel_workers(self) -> int:
+        mode = self.settings.parallel_mode
+        logical = psutil.cpu_count(logical=True) or 1
+        physical = psutil.cpu_count(logical=False) or logical
+        if mode == "off":
+            return 1
+        if mode == "on":
+            return min(max(1, self.settings.max_workers), logical, physical)
+        # auto
+        if self.settings.cpu_limit < 35:
+            return 1
+        workers = min(4, logical, physical,
+                      max(1, int(self.settings.cpu_limit // 25)))
+        return workers
+
+    def _process_file(self, fp: Path) -> dict:
+        cropper = SmartCropper(self.settings)
+        try:
+            return cropper.process(fp)
+        finally:
+            cropper.release()
+
     def run(self):
         self._cancelled = self._paused = False
         total = self.total_files
@@ -788,7 +875,13 @@ class BatchWorker(QThread):
             f"{'BẬT 🧠' if self.settings.adaptive_speed else 'TẮT'}\n"
             f"   Chế độ: CROP pixel gốc (không scale/nền giả)\n")
 
-        self._cropper = SmartCropper(self.settings)
+        parallel_workers = self._calc_parallel_workers()
+        if parallel_workers > 1:
+            self.sig_log.emit(
+                f"   Batch mode: {parallel_workers} luồng song song nếu phần cứng cho phép")
+        else:
+            self._cropper = SmartCropper(self.settings)
+
         throttle = AdaptiveThrottle(
             cpu_target=self.settings.cpu_limit,
             adaptive=self.settings.adaptive_speed)
@@ -810,39 +903,92 @@ class BatchWorker(QThread):
                 f"{'─'*50}")
             self.sig_folder_start.emit(group.label, group.count)
 
-            for fi, fp in enumerate(group.files):
-                if self._cancelled:
-                    self.sig_log.emit("🛑 Đã huỷ!"); break
-                self._check_pause()
-                if self._cancelled:
-                    break
+            if parallel_workers > 1:
+                with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=parallel_workers) as executor:
+                    futures = {}
+                    for fp in group.files:
+                        if self._cancelled:
+                            break
+                        self._check_pause()
+                        future = executor.submit(self._process_file, fp)
+                        futures[future] = fp
+                        self.sig_file_start.emit(
+                            global_idx + len(futures) - 1, fp.name)
 
-                cpu, ram, speed = throttle.tick()
-                self.sig_sysload.emit(cpu, ram, speed)
-                self.sig_file_start.emit(global_idx, fp.name)
+                    for future in concurrent.futures.as_completed(futures):
+                        if self._cancelled:
+                            self.sig_log.emit("🛑 Đã huỷ!"); break
+                        self._check_pause()
 
-                res = self._cropper.process(fp)
-                cnt[res["status"]] = cnt.get(res["status"], 0) + 1
+                        cpu, ram, speed = throttle.tick()
+                        self.sig_sysload.emit(cpu, ram, speed)
 
-                icon = dict(success="✅", skipped="⏭️",
-                            rejected="📦", error="❌").get(
-                    res["status"], "❓")
+                        fp = futures[future]
+                        try:
+                            res = future.result()
+                        except Exception as exc:
+                            res = dict(status="error",
+                                       reason=str(exc),
+                                       input_path=fp,
+                                       output_path=None)
+                        cnt[res["status"]] = cnt.get(res["status"], 0) + 1
 
-                if total > 1000:
-                    if global_idx % 50 == 0 or res["status"] != "success":
+                        icon = dict(success="✅", skipped="⏭️",
+                                    rejected="📦", error="❌").get(
+                            res["status"], "❓")
+
+                        if total > 1000:
+                            if global_idx % 50 == 0 or res["status"] != "success":
+                                self.sig_log.emit(
+                                    f"{icon} [{global_idx+1:,}/{total:,}] "
+                                    f"{fp.name} — {res['reason'][:60]}")
+                        else:
+                            self.sig_log.emit(
+                                f"{icon} [{global_idx+1}/{total}] {fp.name}\n"
+                                f"   └─ {res['reason']}")
+
+                        self.sig_progress.emit(global_idx + 1, total, res)
+                        global_idx += 1
+
+                        if global_idx % GC_EVERY_N == 0:
+                            gc.collect()
+                    if self._cancelled:
+                        break
+            else:
+                for fi, fp in enumerate(group.files):
+                    if self._cancelled:
+                        self.sig_log.emit("🛑 Đã huỷ!"); break
+                    self._check_pause()
+                    if self._cancelled:
+                        break
+
+                    cpu, ram, speed = throttle.tick()
+                    self.sig_sysload.emit(cpu, ram, speed)
+                    self.sig_file_start.emit(global_idx, fp.name)
+
+                    res = self._cropper.process(fp)
+                    cnt[res["status"]] = cnt.get(res["status"], 0) + 1
+
+                    icon = dict(success="✅", skipped="⏭️",
+                                rejected="📦", error="❌").get(
+                        res["status"], "❓")
+
+                    if total > 1000:
+                        if global_idx % 50 == 0 or res["status"] != "success":
+                            self.sig_log.emit(
+                                f"{icon} [{global_idx+1:,}/{total:,}] "
+                                f"{fp.name} — {res['reason'][:60]}")
+                    else:
                         self.sig_log.emit(
-                            f"{icon} [{global_idx+1:,}/{total:,}] "
-                            f"{fp.name} — {res['reason'][:60]}")
-                else:
-                    self.sig_log.emit(
-                        f"{icon} [{global_idx+1}/{total}] {fp.name}\n"
-                        f"   └─ {res['reason']}")
+                            f"{icon} [{global_idx+1}/{total}] {fp.name}\n"
+                            f"   └─ {res['reason']}")
 
-                self.sig_progress.emit(global_idx + 1, total, res)
-                global_idx += 1
+                    self.sig_progress.emit(global_idx + 1, total, res)
+                    global_idx += 1
 
-                if global_idx % GC_EVERY_N == 0:
-                    gc.collect()
+                    if global_idx % GC_EVERY_N == 0:
+                        gc.collect()
 
         elapsed = time.time() - t0
         processed = sum(cnt.values())
@@ -1081,6 +1227,10 @@ class ThumbCard(QFrame):
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation))
 
+    def set_pixmap(self, px):
+        if not px.isNull():
+            self.img_label.setPixmap(px)
+
     def set_px_numpy(self, arr):
         if arr is None or arr.size == 0:
             return
@@ -1123,6 +1273,7 @@ class ThumbGrid(QScrollArea):
         self.setWidget(self._container)
         self._cards: list[ThumbCard] = []
         self._cols = 4; self._total = 0; self._is_large = False
+        self.loader = None
         self._header = QLabel("")
         self._header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._header.setStyleSheet(
@@ -1135,6 +1286,10 @@ class ThumbGrid(QScrollArea):
         return 1 if self._header.isVisible() else 0
 
     def clear(self):
+        if self.loader:
+            self.loader.requestInterruption()
+            self.loader.wait()
+            self.loader = None
         self._grid.removeWidget(self._header)
         self._header.setVisible(False)
         self._header.setParent(None)
@@ -1144,9 +1299,9 @@ class ThumbGrid(QScrollArea):
         self._total = 0; self._is_large = False
         self._grid.addWidget(self._header, 0, 0, 1, 20)
 
-    def populate(self, files):
+    def populate(self, files, total: int | None = None):
         self.clear()
-        self._total = len(files)
+        self._total = total if total is not None else len(files)
         self._is_large = self._total > MAX_GRID_CARDS
         self._calc()
         if self._is_large:
@@ -1158,11 +1313,20 @@ class ThumbGrid(QScrollArea):
             self._header.setVisible(False)
             for i, f in enumerate(files):
                 c = ThumbCard(f.name)
-                c.set_px_path(str(f))
                 self._grid.addWidget(
                     c, i // self._cols, i % self._cols,
                     Qt.AlignmentFlag.AlignTop)
                 self._cards.append(c)
+            self.loader = ThumbnailLoader(files)
+            self.loader.loaded.connect(self._on_thumb_loaded)
+            self.loader.start()
+
+    def _on_thumb_loaded(self, index, data):
+        if 0 <= index < len(self._cards):
+            if isinstance(data, np.ndarray):
+                self._cards[index].set_px_numpy(data)
+            elif isinstance(data, QPixmap):
+                self._cards[index].set_pixmap(data)
 
     def update_card(self, gi, result):
         if self._is_large:
@@ -1353,6 +1517,41 @@ class Dashboard(QWidget):
             "TẮT: Sleep cố định")
         g4l.addWidget(self.chk_adaptive)
 
+        self.cb_parallel = QComboBox()
+        self.cb_parallel.addItems([
+            "Auto (tự phân phối)",
+            "Bật (cố định số luồng)",
+            "Tắt (1 luồng)"
+        ])
+        self.cb_parallel.setToolTip(
+            "Auto: chọn luồng theo cấu hình máy và CPU limit.\n"
+            "Bật: dùng số luồng cố định.\n"
+            "Tắt: xử lý tuần tự.")
+        g4l.addWidget(self.cb_parallel)
+
+        self.sp_workers = SpinRow(
+            "Số luồng tối đa:", 1, 8, 1)
+        self.sp_workers.setVisible(False)
+        g4l.addWidget(self.sp_workers)
+
+        self.lbl_parallel = QLabel(
+            f"Máy: {self.sys.cores_p}C / {self.sys.cores_l}T")
+        self.lbl_parallel.setAlignment(
+            Qt.AlignmentFlag.AlignCenter)
+        self.lbl_parallel.setStyleSheet(
+            f"color:{C['acc']};font-size:11px;font-weight:600;"
+            f"padding:4px;background:{C['bg_in']};"
+            f"border:1px solid {C['brd']};border-radius:5px;")
+        g4l.addWidget(self.lbl_parallel)
+
+        self.cb_parallel.currentIndexChanged.connect(
+            self._update_parallel_ui)
+        self.cb_parallel.currentIndexChanged.connect(
+            self._update_worker_label)
+        self.sp_workers.spin.valueChanged.connect(
+            self._update_worker_label)
+        self.sl_cpu.valueChanged.connect(self._update_worker_label)
+
         self.lbl_speed = QLabel("⚡ Chờ bắt đầu...")
         self.lbl_speed.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_speed.setStyleSheet(
@@ -1436,6 +1635,37 @@ class Dashboard(QWidget):
                   self.sp_pad_l, self.sp_pad_r]:
             s.setVisible(not u)
 
+    def _update_parallel_ui(self, idx: int):
+        mode = ["auto", "on", "off"][idx]
+        self.sp_workers.setVisible(mode == "on")
+        self._update_worker_label()
+
+    def _update_worker_label(self):
+        if not hasattr(self, "lbl_workers"):
+            return
+
+        settings = self.get_settings()
+        logical = psutil.cpu_count(logical=True) or 1
+        physical = psutil.cpu_count(logical=False) or logical
+        if settings.parallel_mode == "off":
+            workers = 1
+        elif settings.parallel_mode == "on":
+            workers = min(max(1, settings.max_workers), logical, physical)
+        else:
+            if settings.cpu_limit < 35:
+                workers = 1
+            else:
+                workers = min(4, logical, physical,
+                              max(1, int(settings.cpu_limit // 25)))
+
+        if settings.parallel_mode == "off":
+            text = "1 luồng (tuần tự)"
+        elif settings.parallel_mode == "on":
+            text = f"Cố định {workers} luồng"
+        else:
+            text = f"Tự động {workers} luồng"
+        self.lbl_workers.setText(f"Workers: {text}")
+
     def get_settings(self) -> CropSettings:
         s = CropSettings(
             model_name=self.cb_model.currentText(),
@@ -1455,7 +1685,9 @@ class Dashboard(QWidget):
             rejected_folder=self.txt_rej.value() or "Loại bỏ",
             cpu_limit=self.sl_cpu.value(),
             scan_subfolders=self.chk_subfolder.isChecked(),
-            adaptive_speed=self.chk_adaptive.isChecked())
+            adaptive_speed=self.chk_adaptive.isChecked(),
+            parallel_mode=["auto", "on", "off"][self.cb_parallel.currentIndex()],
+            max_workers=self.sp_workers.value())
         s.save()
         return s
 
@@ -1475,7 +1707,12 @@ class Dashboard(QWidget):
         self.sl_fill.setValue(s.subject_fill)
         self.sl_cpu.setValue(s.cpu_limit)
         self.chk_adaptive.setChecked(s.adaptive_speed)
+        self.cb_parallel.setCurrentIndex(
+            {"auto": 0, "on": 1, "off": 2}.get(s.parallel_mode, 0))
+        self.sp_workers.setValue(max(1, s.max_workers))
+        self._update_parallel_ui(self.cb_parallel.currentIndex())
         self.chk_subfolder.setChecked(s.scan_subfolders)
+        self._update_worker_label()
         self.sp_png.setValue(s.png_compress)
         self.sp_min.setValue(s.min_size_px)
         self.txt_out.setValue(s.output_folder)
@@ -1507,6 +1744,7 @@ class MainWindow(QMainWindow):
         self.worker.sig_log.connect(self._on_log)
         self.worker.sig_sysload.connect(self._on_sysload)
         self.worker.sig_folder_start.connect(self._on_folder_start)
+        self.scanner: FolderScanner | None = None
         self._busy = False
         self.setStyleSheet(build_qss())
         self._build(); self._setup_sb(); self._start_mon()
@@ -1607,6 +1845,14 @@ class MainWindow(QMainWindow):
                 f"font-family:'Cascadia Code',monospace;padding:0 4px;")
         sb.addPermanentWidget(self.lbl_cpu)
         sb.addPermanentWidget(self.lbl_ram)
+        self.lbl_workers = QLabel("Workers: --")
+        self.lbl_workers.setStyleSheet(
+            f"color:{C['t2']};font-size:11px;font-weight:600;"
+            f"font-family:'Cascadia Code',monospace;padding:0 4px;")
+        sb.addPermanentWidget(self.lbl_workers)
+        if hasattr(self, 'dash'):
+            self.dash.lbl_workers = self.lbl_workers
+            self.dash._update_worker_label()
 
     def _start_mon(self):
         self._timer = QTimer(self)
@@ -1634,9 +1880,26 @@ class MainWindow(QMainWindow):
 
     def _on_folder(self, path):
         settings = self.dash.get_settings()
-        self.worker.set_folder(path, settings.scan_subfolders)
+        if self.scanner and self.scanner.isRunning():
+            self.scanner.requestInterruption()
+            self.scanner.wait()
+            self.scanner = None
+
+        self.lbl_count.setText("⏳ Đang quét thư mục...")
+        self.btn_start.setEnabled(False)
+        self.progress.setMaximum(1)
+        self.progress.setValue(0)
+        self.thumbs.clear()
+
+        self.scanner = FolderScanner(path, settings.scan_subfolders)
+        self.scanner.scanned.connect(self._on_folder_scanned)
+        self.scanner.error.connect(self._on_folder_scan_error)
+        self.scanner.start()
+
+    def _on_folder_scanned(self, groups, path):
+        self.worker.groups = groups
         n = self.worker.total_files
-        ng = len(self.worker.groups)
+        ng = len(groups)
         folder_info = (f"📁 {n:,} ảnh" +
                        (f" ({ng} thư mục)" if ng > 1 else ""))
         self.lbl_count.setText(
@@ -1645,17 +1908,34 @@ class MainWindow(QMainWindow):
         self.progress.setMaximum(max(n, 1))
         self.progress.setValue(0)
         if n:
-            all_files = [f for g in self.worker.groups for f in g.files]
-            self.thumbs.populate(all_files)
+            if n > MAX_GRID_CARDS:
+                limited_files = []
+                for g in groups:
+                    for f in g.files:
+                        limited_files.append(f)
+                        if len(limited_files) >= MAX_GRID_CARDS:
+                            break
+                    if len(limited_files) >= MAX_GRID_CARDS:
+                        break
+                self.thumbs.populate(limited_files, total=n)
+            else:
+                all_files = [f for g in groups for f in g.files]
+                self.thumbs.populate(all_files)
             log_msg = f"📂 {path}\n📁 {n:,} ảnh"
             if ng > 1:
                 log_msg += f" trong {ng} thư mục:\n"
-                for g in self.worker.groups:
+                for g in groups:
                     log_msg += (f"   📁 {g.label or '(gốc)'}: "
                                 f"{g.count} ảnh\n")
             self._on_log(log_msg)
         else:
             self.thumbs.clear()
+        self.scanner = None
+
+    def _on_folder_scan_error(self, message):
+        self._on_log(f"⚠️ Lỗi quét thư mục: {message}")
+        self.lbl_count.setText("⚠️ Lỗi khi quét thư mục")
+        self.scanner = None
 
     def _on_start(self):
         if self._busy:
